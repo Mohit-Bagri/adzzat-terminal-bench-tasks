@@ -1,0 +1,616 @@
+diff --git a/lmformatenforcer/regexparser.py b/lmformatenforcer/regexparser.py
+index ca40fa6..061a15e 100644
+--- a/lmformatenforcer/regexparser.py
++++ b/lmformatenforcer/regexparser.py
+@@ -3,6 +3,7 @@ import interegular
+ from interegular.fsm import anything_else
+ 
+ from .characterlevelparser import CharacterLevelParser, CharacterLevelParserConfig
++from .utf8bytes import ByteLevelRegex
+ 
+ class RegexParser(CharacterLevelParser):
+     """RegexParser is an example CharacterLevelParser that only allows strings that match a given regular expression."""
+@@ -14,6 +15,7 @@ class RegexParser(CharacterLevelParser):
+         pattern: interegular.FSM
+         anything_else_characters: str
+         state_character_cache: Dict[int, str]
++        byte_level: Optional[ByteLevelRegex] = None
+     
+     context: _Context
+     current_state: int
+@@ -51,6 +53,12 @@ class RegexParser(CharacterLevelParser):
+     
+     def can_end(self) -> bool:
+         return self.current_state in self.context.pattern.finals or self.current_state == RegexParser.INVALID_STATE
++
++    def byte_level(self) -> ByteLevelRegex:
++        """Byte-level view of this parser's pattern, built once per pattern."""
++        if self.context.byte_level is None:
++            self.context.byte_level = ByteLevelRegex(self.context.pattern, anything_else)
++        return self.context.byte_level
+     
+     def get_allowed_characters(self) -> str:
+         if self.current_state not in self.context.pattern.map:
+diff --git a/lmformatenforcer/tokenbytes.py b/lmformatenforcer/tokenbytes.py
+new file mode 100644
+index 0000000..4d8b016
+--- /dev/null
++++ b/lmformatenforcer/tokenbytes.py
+@@ -0,0 +1,63 @@
++"""Exact output bytes of each token of a Hugging Face `tokenizers.Tokenizer`.
++
++Two vocabulary families are supported:
++
++* byte-level BPE (GPT-2 style, ByteLevel decoder): every character of a token maps back to one
++  byte through the byte-to-unicode table;
++* SentencePiece-style BPE with byte fallback (Llama style): a piece `<0xNN>` is the single byte
++  0xNN, and any other piece is its UTF-8 text with every U+2581 replaced by a space.
++"""
++import json
++from typing import Any, Dict
++
++SPACE_MARKER = "▁"
++
++
++def _unicode_to_byte() -> Dict[str, int]:
++    printable = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
++    codes = printable[:]
++    extra = 0
++    for b in range(256):
++        if b not in printable:
++            printable.append(b)
++            codes.append(256 + extra)
++            extra += 1
++    return {chr(c): b for b, c in zip(printable, codes)}
++
++
++def _has_type(node: Any, name: str) -> bool:
++    if isinstance(node, dict):
++        if node.get("type") == name:
++            return True
++        return any(_has_type(value, name) for value in node.values())
++    if isinstance(node, list):
++        return any(_has_type(value, name) for value in node)
++    return False
++
++
++def _byte_token(piece: str):
++    if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
++        try:
++            return bytes([int(piece[3:5], 16)])
++        except ValueError:
++            return None
++    return None
++
++
++def token_bytes_from_tokenizer(tokenizer) -> Dict[int, bytes]:
++    """Map every regular (non-special) token id to the exact bytes it adds to the output."""
++    spec = json.loads(tokenizer.to_str())
++    special = {token["id"] for token in spec.get("added_tokens", []) if token.get("special")}
++    vocab = {piece: token_id for piece, token_id in tokenizer.get_vocab(with_added_tokens=False).items()
++             if token_id not in special}
++    model = spec.get("model", {})
++    if _has_type(spec.get("decoder"), "ByteLevel"):
++        table = _unicode_to_byte()
++        return {token_id: bytes(table[ch] for ch in piece) for piece, token_id in vocab.items()}
++    if model.get("byte_fallback"):
++        result = {}
++        for piece, token_id in vocab.items():
++            single = _byte_token(piece)
++            result[token_id] = single if single is not None else piece.replace(SPACE_MARKER, " ").encode("utf-8")
++        return result
++    raise ValueError("unsupported vocabulary: expected a byte-level BPE or a byte-fallback SentencePiece-style model")
+diff --git a/lmformatenforcer/tokenenforcer.py b/lmformatenforcer/tokenenforcer.py
+index 2f392f1..69582f6 100644
+--- a/lmformatenforcer/tokenenforcer.py
++++ b/lmformatenforcer/tokenenforcer.py
+@@ -4,9 +4,33 @@ from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Union
+ import logging
+ 
+ from .exceptions import LMFormatEnforcerException
+-from .characterlevelparser import CharacterLevelParser, ForceStopParser, CharacterLevelParserConfig
++from .characterlevelparser import CharacterLevelParser, ForceStopParser, CharacterLevelParserConfig, SequenceParser, StringParser, UnionParser
+ from .tokenizerprefixtree import TokenizerPrefixTree, TokenizerPrefixTreeNode
+ from .tokenlist import TokenList
++from .regexparser import RegexParser
++from .jsonschemaparser import JsonSchemaParser
++from .utf8bytes import ByteState, CharacterParserBytes, base_alphabet, build_byte_trie, collect_allowed, constraint_characters
++
++
++def _parser_tree(parser: CharacterLevelParser):
++    """The parser and every parser nested in it through SequenceParser / UnionParser."""
++    yield parser
++    if isinstance(parser, (SequenceParser, UnionParser)):
++        for child in parser.parsers:
++            yield from _parser_tree(child)
++
++
++def _explicit_characters(parser: CharacterLevelParser) -> set:
++    """Characters a parser names explicitly, as opposed to characters it takes from its alphabet."""
++    if isinstance(parser, StringParser):
++        return set(parser.target_str)
++    if isinstance(parser, RegexParser):
++        from interegular.fsm import anything_else
++        return {c for c in parser.context.pattern.alphabet.keys() if c is not anything_else and len(c) == 1}
++    context = getattr(parser, "context", None)
++    if isinstance(context, JsonSchemaParser._Context):
++        return constraint_characters(context.model_class)
++    return set()
+ 
+ 
+ class TokenEnforcerTokenizerData:
+@@ -17,13 +41,17 @@ class TokenEnforcerTokenizerData:
+                  decoder: Callable[[List[int]], str],
+                  eos_token_id: Union[int, List[int]],
+                  use_bitmask: bool,
+-                 vocab_size: int):
++                 vocab_size: int,
++                 token_bytes: Optional[Dict[int, bytes]] = None):
+         """
+         Create the tokenizer data that the TokenEnforcer needs. This can be reused for multiple TokenEnforcers if they work with the same tokenizer.
+         :param regular_tokens: A list of tuples (token_id, token_string, is_new_word_token) for all the regular (not special) tokens in the tokenizer vocabulary.
+         Note that token_string is expected to include leading / trailing whitespaces if relevant.
+         :param decoder: A function that decodes a list of token ids into a string.
+         :param eos_token_id: The token id(s) of the end-of-string token(s).
++        :param token_bytes: Optional mapping from each regular token id to the exact bytes it adds to the output.
++        When given, regular expression constraints are enforced on the UTF-8 byte level, so tokens that hold
++        incomplete characters are allowed exactly when they can still lead to a match.
+         """
+         filtered_regular_tokens = [token_tuple for token_tuple in regular_tokens if token_tuple[0] <= vocab_size]
+         self.regular_tokens = filtered_regular_tokens
+@@ -33,6 +61,11 @@ class TokenEnforcerTokenizerData:
+         self.tokenizer_alphabet = "".join(token_str for token_str in self.tokenizer_tree.root.children.keys() if len(token_str) == 1)
+         self.vocab_size = vocab_size
+         self.use_bitmask = use_bitmask
++        self.token_bytes = None if token_bytes is None else {
++            token_id: data for token_id, data in token_bytes.items() if token_id <= vocab_size}
++        self.byte_trie = None if self.token_bytes is None else build_byte_trie(self.token_bytes)
++        # With token_bytes, "any character" means any Unicode scalar value (see CharacterParserBytes).
++        self.byte_alphabet = None if self.token_bytes is None else base_alphabet(self.token_bytes)
+ 
+ 
+ class TokenEnforcer:
+@@ -43,6 +76,8 @@ class TokenEnforcer:
+         parser: CharacterLevelParser
+         allowed_tokens: TokenList | None = field(default=None)
+         current_word_tokens: List[int] = field(default_factory=list)
++        byte_state: Optional[ByteState] = None
++        pending_bytes: bytes = b""
+         
+ 
+     def __init__(self, tokenizer_data: TokenEnforcerTokenizerData, parser: CharacterLevelParser):
+@@ -60,10 +95,27 @@ class TokenEnforcer:
+         self.allowed_token_cache: Dict[Hashable, Any] = {}
+         self.use_bitmask = tokenizer_data.use_bitmask
+         self.vocab_size = tokenizer_data.vocab_size
+-        
+-        
++        self.token_bytes = tokenizer_data.token_bytes
++        self.byte_trie = tokenizer_data.byte_trie
++        self.byte_regex = parser.byte_level() if self.byte_trie is not None and isinstance(parser, RegexParser) else None
++        self.byte_parser = None
++        byte_alphabet = None
++        if self.byte_trie is not None and self.byte_regex is None:
++            explicit = set()
++            for node in _parser_tree(parser):
++                explicit |= _explicit_characters(node)
++            byte_alphabet = "".join(sorted(set(tokenizer_data.byte_alphabet) | explicit | {CharacterParserBytes.STAND_IN}))
++            self.byte_parser = CharacterParserBytes(byte_alphabet)
++
+         # Preserve the parser's existing config (e.g., force_json_field_order) when updating alphabet
+-        parser.config = replace(parser.config, alphabet=tokenizer_data.tokenizer_alphabet)
++        alphabet = byte_alphabet if self.byte_parser is not None else tokenizer_data.tokenizer_alphabet
++        nodes = list(_parser_tree(parser)) if self.byte_parser is not None else [parser]
++        for node in nodes:
++            # Composite parsers do not pass their config to the parsers they contain.
++            node.config = replace(node.config, alphabet=alphabet)
++            if self.byte_parser is not None and isinstance(getattr(node, "context", None), JsonSchemaParser._Context):
++                # The JSON parser derives its quote-free alphabet once, at construction; keep it in step.
++                node.context.alphabet_without_quotes = alphabet.replace('"', '')
+ 
+     def get_allowed_tokens(self, token_sequence: List[int]) -> TokenList:
+         """
+@@ -84,6 +136,8 @@ class TokenEnforcer:
+             # We have not encountered the tensor up to the before-last entry. This means that this is the first call - the instruction / prompt tensor.
+             # Initialize the root node
+             state = TokenEnforcer.OutputTensorState(parser=self.root_parser)
++            if self.byte_regex is not None:
++                state.byte_state = (self.root_parser.current_state, b"")
+             self.prefix_states[sent_tuple] = state
+             self._compute_allowed_tokens(sent_tuple, state)
+             return state.allowed_tokens
+@@ -96,6 +150,12 @@ class TokenEnforcer:
+             return new_state.allowed_tokens
+ 
+     def _compute_allowed_tokens(self, state_tokens: Tuple, state: 'TokenEnforcer.OutputTensorState'):
++        if self.byte_regex is not None:
++            self._compute_allowed_tokens_bytes(state)
++            return
++        if self.byte_parser is not None:
++            self._compute_allowed_tokens_parser_bytes(state)
++            return
+         try:
+             allowed_tokens: TokenList = TokenList(self.use_bitmask, self.vocab_size)
+             
+@@ -135,6 +195,44 @@ class TokenEnforcer:
+             else:
+                 state.allowed_tokens.append(self.eos_token_id)
+ 
++    def _eos_tokens(self) -> List[int]:
++        return list(self.eos_token_id) if isinstance(self.eos_token_id, list) else [self.eos_token_id]
++
++    def _compute_allowed_tokens_bytes(self, state: 'TokenEnforcer.OutputTensorState'):
++        cache_key = ('bytes', state.byte_state)
++        if cache_key in self.allowed_token_cache:
++            state.allowed_tokens = self.allowed_token_cache[cache_key]
++            return
++        allowed_tokens = TokenList(self.use_bitmask, self.vocab_size)
++        if state.byte_state is None:
++            # The sequence left the language (possible with beams); only stopping is allowed.
++            allowed_tokens.extend(self._eos_tokens())
++        else:
++            collected: List[int] = []
++            collect_allowed(self.byte_regex, self.byte_trie, state.byte_state, collected)
++            allowed_tokens.extend(collected)
++            if self.byte_regex.can_end(state.byte_state):
++                allowed_tokens.extend(self._eos_tokens())
++        state.allowed_tokens = allowed_tokens
++        self.allowed_token_cache[cache_key] = allowed_tokens
++
++    def _compute_allowed_tokens_parser_bytes(self, state: 'TokenEnforcer.OutputTensorState'):
++        cache_key = state.parser.cache_key()
++        if cache_key is not None:
++            cache_key = ('parser-bytes', cache_key, state.pending_bytes)
++            if cache_key in self.allowed_token_cache:
++                state.allowed_tokens = self.allowed_token_cache[cache_key]
++                return
++        allowed_tokens = TokenList(self.use_bitmask, self.vocab_size)
++        collected: List[int] = []
++        self.byte_parser.collect(self.byte_trie, state.parser, state.pending_bytes, collected)
++        allowed_tokens.extend(collected)
++        if not state.pending_bytes and state.parser.can_end():
++            allowed_tokens.extend(self._eos_tokens())
++        state.allowed_tokens = allowed_tokens
++        if cache_key is not None:
++            self.allowed_token_cache[cache_key] = allowed_tokens
++
+     def _collect_allowed_tokens(self, parser: CharacterLevelParser, tree_node: TokenizerPrefixTreeNode, allowed_tokens: TokenList, shortcut_key: Optional[Hashable]):
+         allowed_tokens.extend(tree_node.tokens)
+         allowed_characters = parser.get_allowed_characters()
+@@ -162,6 +260,21 @@ class TokenEnforcer:
+             self._collect_allowed_tokens(next_parser, next_tree_node, allowed_tokens, None)
+             
+     def _apply_new_characters(self, state: 'TokenEnforcer.OutputTensorState', token_sequence: List[int]):
++        if self.byte_regex is not None:
++            new_state = TokenEnforcer.OutputTensorState(parser=state.parser)
++            data = self.token_bytes.get(token_sequence[-1])
++            if state.byte_state is not None and data:
++                new_state.byte_state = self.byte_regex.advance(state.byte_state, data)
++            return new_state
++        if self.byte_parser is not None:
++            new_state = TokenEnforcer.OutputTensorState(parser=state.parser)
++            data = self.token_bytes.get(token_sequence[-1])
++            advanced = self.byte_parser.advance(state.parser, state.pending_bytes, data) if data else None
++            if advanced is None:
++                new_state.parser = ForceStopParser()
++            else:
++                new_state.parser, new_state.pending_bytes = advanced
++            return new_state
+         new_state = TokenEnforcer.OutputTensorState(parser=state.parser)
+         new_token = token_sequence[-1]
+         if new_token in self.tokenizer_tree.new_word_tokens:
+diff --git a/lmformatenforcer/utf8bytes.py b/lmformatenforcer/utf8bytes.py
+new file mode 100644
+index 0000000..5f8c537
+--- /dev/null
++++ b/lmformatenforcer/utf8bytes.py
+@@ -0,0 +1,309 @@
++"""Byte-level stepping of a RegexParser over UTF-8 encoded tokens.
++
++A byte-level state is (regex FSM state, pending bytes of an incomplete UTF-8 character).
++A byte sequence is accepted only while it stays a strict UTF-8 prefix whose completed
++characters drive the FSM to a state from which a final state is still reachable, and
++whose pending bytes can still be completed by a character the FSM can take.
++"""
++import bisect
++from typing import Dict, List, Optional, Tuple
++
++MAX_CODE_POINT = 0x10FFFF
++SURROGATE_LOW, SURROGATE_HIGH = 0xD800, 0xDFFF
++
++Ranges = Tuple[Tuple[int, int], ...]
++ByteState = Tuple[int, bytes]
++
++
++def _sequence_length(lead: int) -> int:
++    if 0xC2 <= lead <= 0xDF:
++        return 2
++    if 0xE0 <= lead <= 0xEF:
++        return 3
++    if 0xF0 <= lead <= 0xF4:
++        return 4
++    return 0
++
++
++def completion_ranges(pending: bytes) -> Ranges:
++    """Code point ranges whose UTF-8 encoding starts with the incomplete sequence `pending`."""
++    length = _sequence_length(pending[0])
++    if length == 0 or len(pending) >= length:
++        return ()
++    if any(b & 0xC0 != 0x80 for b in pending[1:]):
++        return ()
++    bits = pending[0] & (0x7F >> length)
++    for b in pending[1:]:
++        bits = (bits << 6) | (b & 0x3F)
++    remaining = 6 * (length - len(pending))
++    low, high = bits << remaining, (bits << remaining) | ((1 << remaining) - 1)
++    valid_low = {2: 0x80, 3: 0x800, 4: 0x10000}[length]
++    valid_high = {2: 0x7FF, 3: 0xFFFF, 4: MAX_CODE_POINT}[length]
++    low, high = max(low, valid_low), min(high, valid_high)
++    if low > high:
++        return ()
++    if high < SURROGATE_LOW or low > SURROGATE_HIGH:
++        return ((low, high),)
++    ranges = []
++    if low < SURROGATE_LOW:
++        ranges.append((low, SURROGATE_LOW - 1))
++    if high > SURROGATE_HIGH:
++        ranges.append((SURROGATE_HIGH + 1, high))
++    return tuple(ranges)
++
++
++class ByteLevelRegex:
++    """Byte-level view of an interegular FSM, shared by every parser built from one pattern."""
++
++    def __init__(self, fsm, anything_else):
++        self.fsm = fsm
++        self.anything_else = anything_else
++        self.explicit: List[int] = sorted(ord(c) for c in fsm.alphabet if c is not anything_else and len(c) == 1)
++        self.live = self._live_states()
++        self._step_cache: Dict[Tuple[ByteState, int], Optional[ByteState]] = {}
++        self._complete_cache: Dict[Tuple[int, bytes], bool] = {}
++
++    def _live_states(self):
++        reverse: Dict[int, set] = {}
++        for state, transitions in self.fsm.map.items():
++            for target in transitions.values():
++                reverse.setdefault(target, set()).add(state)
++        live = set(self.fsm.finals)
++        stack = list(live)
++        while stack:
++            for previous in reverse.get(stack.pop(), ()):
++                if previous not in live:
++                    live.add(previous)
++                    stack.append(previous)
++        return live
++
++    def char_step(self, state: int, char: str) -> Optional[int]:
++        alphabet = self.fsm.alphabet
++        symbol = char if char in alphabet else self.anything_else
++        if symbol not in alphabet:
++            return None
++        target = self.fsm.map.get(state, {}).get(alphabet[symbol])
++        return target if target is not None and target in self.live else None
++
++    def _count_explicit(self, low: int, high: int) -> int:
++        return bisect.bisect_right(self.explicit, high) - bisect.bisect_left(self.explicit, low)
++
++    def can_complete(self, state: int, pending: bytes) -> bool:
++        key = (state, pending)
++        if key in self._complete_cache:
++            return self._complete_cache[key]
++        ranges = completion_ranges(pending)
++        result = False
++        if ranges:
++            for low, high in ranges:
++                lo_index = bisect.bisect_left(self.explicit, low)
++                hi_index = bisect.bisect_right(self.explicit, high)
++                if any(self.char_step(state, chr(cp)) is not None for cp in self.explicit[lo_index:hi_index]):
++                    result = True
++                    break
++                outside = (high - low + 1) - (hi_index - lo_index)
++                if outside > 0 and self.anything_else in self.fsm.alphabet:
++                    target = self.fsm.map.get(state, {}).get(self.fsm.alphabet[self.anything_else])
++                    if target is not None and target in self.live:
++                        result = True
++                        break
++        self._complete_cache[key] = result
++        return result
++
++    def step(self, byte_state: ByteState, byte: int) -> Optional[ByteState]:
++        key = (byte_state, byte)
++        if key in self._step_cache:
++            return self._step_cache[key]
++        state, pending = byte_state
++        result: Optional[ByteState] = None
++        if not pending:
++            if byte < 0x80:
++                target = self.char_step(state, chr(byte))
++                result = (target, b"") if target is not None else None
++            elif _sequence_length(byte):
++                new_pending = bytes([byte])
++                result = (state, new_pending) if self.can_complete(state, new_pending) else None
++        elif byte & 0xC0 == 0x80:
++            new_pending = pending + bytes([byte])
++            if len(new_pending) == _sequence_length(new_pending[0]):
++                try:
++                    char = new_pending.decode("utf-8")
++                except UnicodeDecodeError:
++                    char = None
++                target = self.char_step(state, char) if char is not None else None
++                result = (target, b"") if target is not None else None
++            elif self.can_complete(state, new_pending):
++                result = (state, new_pending)
++        self._step_cache[key] = result
++        return result
++
++    def advance(self, byte_state: ByteState, data: bytes) -> Optional[ByteState]:
++        for byte in data:
++            byte_state = self.step(byte_state, byte)
++            if byte_state is None:
++                return None
++        return byte_state
++
++    def can_end(self, byte_state: ByteState) -> bool:
++        state, pending = byte_state
++        return not pending and state in self.fsm.finals
++
++
++class ByteTrieNode:
++    __slots__ = ("tokens", "children")
++
++    def __init__(self):
++        self.tokens: List[int] = []
++        self.children: Dict[int, "ByteTrieNode"] = {}
++
++
++def build_byte_trie(token_bytes: Dict[int, bytes]) -> ByteTrieNode:
++    root = ByteTrieNode()
++    for token_id, data in token_bytes.items():
++        if not data:
++            continue
++        node = root
++        for byte in data:
++            child = node.children.get(byte)
++            if child is None:
++                child = node.children[byte] = ByteTrieNode()
++            node = child
++        node.tokens.append(token_id)
++    return root
++
++
++def collect_allowed(regex: ByteLevelRegex, node: ByteTrieNode, byte_state: ByteState, out: List[int]) -> None:
++    stack = [(node, byte_state)]
++    while stack:
++        current, current_state = stack.pop()
++        for byte, child in current.children.items():
++            next_state = regex.step(current_state, byte)
++            if next_state is None:
++                continue
++            out.extend(child.tokens)
++            if child.children:
++                stack.append((child, next_state))
++
++
++class CharacterParserBytes:
++    """Byte-level stepping for parsers that list their allowed characters.
++
++    The state is (parser, pending bytes). The parser's alphabet holds every character that
++    occurs complete in a token, every character the constraint names explicitly, and the
++    private-use character STAND_IN, which no constraint names. A character outside that
++    alphabet belongs to exactly the same allowed sets as STAND_IN, so it is fed as STAND_IN.
++    Pending bytes are kept when they begin an allowed character or when STAND_IN is allowed.
++    """
++
++    STAND_IN = "\ue000"
++
++    def __init__(self, alphabet: str):
++        self._alphabet = frozenset(alphabet)
++        self._sets: Dict[str, Tuple[frozenset, bool, frozenset]] = {}
++
++    def _info(self, parser):
++        characters = parser.get_allowed_characters()
++        cached = self._sets.get(characters)
++        if cached is None:
++            allowed = frozenset(characters)
++            prefixes = set()
++            for char in allowed:
++                if ord(char) > 0x7F:
++                    encoded = char.encode("utf-8")
++                    for cut in range(1, len(encoded)):
++                        prefixes.add(encoded[:cut])
++            cached = self._sets[characters] = (allowed, self.STAND_IN in allowed, frozenset(prefixes))
++        return cached
++
++    def step(self, parser, pending: bytes, byte: int):
++        allowed, any_character, prefixes = self._info(parser)
++        candidate = pending + bytes([byte])
++        length = _sequence_length(candidate[0]) if candidate[0] >= 0x80 else 1
++        if length == 0:
++            return None
++        if len(candidate) < length:
++            if not completion_ranges(candidate):
++                return None
++            return (parser, candidate) if any_character or candidate in prefixes else None
++        try:
++            char = candidate.decode("utf-8")
++        except UnicodeDecodeError:
++            return None
++        fed = char if char in self._alphabet else self.STAND_IN
++        if fed not in allowed:
++            return None
++        next_parser = parser.add_character(fed)
++        if not next_parser.get_allowed_characters() and not next_parser.can_end():
++            return None
++        return next_parser, b""
++
++    def advance(self, parser, pending: bytes, data: bytes):
++        for byte in data:
++            stepped = self.step(parser, pending, byte)
++            if stepped is None:
++                return None
++            parser, pending = stepped
++        return parser, pending
++
++    def collect(self, node: ByteTrieNode, parser, pending: bytes, out: List[int]) -> None:
++        stack = [(node, parser, pending)]
++        while stack:
++            current, current_parser, current_pending = stack.pop()
++            for byte, child in current.children.items():
++                stepped = self.step(current_parser, current_pending, byte)
++                if stepped is None:
++                    continue
++                out.extend(child.tokens)
++                if child.children:
++                    stack.append((child, stepped[0], stepped[1]))
++
++
++def constraint_characters(model) -> set:
++    """Characters a parsed JSON schema names explicitly (keys, enum/const strings, pattern classes)."""
++    import interegular
++    from interegular.fsm import anything_else
++    found: set = set()
++    seen: set = set()
++
++    def walk(node):
++        if id(node) in seen:
++            return
++        seen.add(id(node))
++        if isinstance(node, str):
++            found.update(node)
++        elif isinstance(node, dict):
++            for key, value in node.items():
++                walk(key)
++                walk(value)
++        elif isinstance(node, (list, tuple, set)):
++            for item in node:
++                walk(item)
++        elif hasattr(node, "__dict__"):
++            for name, value in vars(node).items():
++                if name == "pattern" and isinstance(value, str):
++                    body = value[1:] if value.startswith("^") else value
++                    body = body[:-1] if body.endswith("$") else body
++                    fsm = interegular.parse_pattern(body).to_fsm()
++                    found.update(c for c in fsm.alphabet if c is not anything_else and len(c) == 1)
++                else:
++                    walk(value)
++
++    walk(model)
++    return found
++
++
++def base_alphabet(token_bytes: Dict[int, bytes]) -> str:
++    """Printable ASCII plus every character occurring complete inside some token."""
++    characters = set(chr(c) for c in range(0x20, 0x7F))
++    for data in token_bytes.values():
++        for start in range(len(data)):
++            end = len(data)
++            while end > start:
++                try:
++                    characters.update(data[start:end].decode("utf-8"))
++                    break
++                except UnicodeDecodeError:
++                    end -= 1
++            if end > start:
++                break
++    return "".join(sorted(characters))

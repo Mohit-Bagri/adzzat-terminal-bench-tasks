@@ -1,0 +1,860 @@
+diff --git a/litellm/litellm_core_utils/litellm_logging.py b/litellm/litellm_core_utils/litellm_logging.py
+index b2c2288..a06938d 100644
+--- a/litellm/litellm_core_utils/litellm_logging.py
++++ b/litellm/litellm_core_utils/litellm_logging.py
+@@ -1797,6 +1797,22 @@ class Logging(LiteLLMLoggingBaseClass):
+         if margin_total_amount is not None:
+             self.cost_breakdown["margin_total_amount"] = margin_total_amount
+ 
++    def _apply_midstream_prior_hops(self, complete_streaming_response: object) -> None:
++        """Fold usage and cost of earlier hops of a continued stream into this log."""
++        prior = self.model_call_details.get("litellm_midstream_prior_hops")
++        if not prior:
++            return
++        usage = getattr(complete_streaming_response, "usage", None)
++        if usage is not None:
++            prompt = sum(hop_usage.prompt_tokens or 0 for hop_usage, _ in prior)
++            completion = sum(hop_usage.completion_tokens or 0 for hop_usage, _ in prior)
++            usage.prompt_tokens = (usage.prompt_tokens or 0) + prompt
++            usage.completion_tokens = (usage.completion_tokens or 0) + completion
++            usage.total_tokens = (usage.total_tokens or 0) + prompt + completion
++        cost = self.model_call_details.get("response_cost")
++        if cost is not None:
++            self.model_call_details["response_cost"] = cost + sum(hop_cost for _, hop_cost in prior)
++
+     def _response_cost_calculator(
+         self,
+         result: Union[
+@@ -2786,6 +2802,8 @@ class Logging(LiteLLMLoggingBaseClass):
+         **kwargs: Any,  # kwargs-ok: forwarded from success_handler
+     ) -> None:
+         verbose_logger.debug("Logging Details LiteLLM-Success Call: Cache_hit=%s", cache_hit)
++        if self.model_call_details.get("litellm_midstream_failed_hop"):
++            return  # a failed hop of a continued stream; the continuing hop logs the request
+         if not self.should_run_logging(event_type="sync_success"):  # prevent double logging
+             return
+         start_time, end_time, result = self._success_handler_helper_fn(
+@@ -2818,6 +2836,7 @@ class Logging(LiteLLMLoggingBaseClass):
+                 self.model_call_details["response_cost"] = self._response_cost_calculator(
+                     result=complete_streaming_response
+                 )
++                self._apply_midstream_prior_hops(complete_streaming_response)
+                 self._merge_hidden_params_from_response_into_metadata(complete_streaming_response)
+                 logged_streaming_response: Final = self._with_client_facing_stream_model(complete_streaming_response)
+                 self.model_call_details["complete_streaming_response"] = logged_streaming_response
+@@ -3230,6 +3249,8 @@ class Logging(LiteLLMLoggingBaseClass):
+         Implementing async callbacks, to handle asyncio event loop issues when custom integrations need to use async functions.
+         """
+         print_verbose(f"Logging Details LiteLLM-Async Success Call, cache_hit={cache_hit}")
++        if self.model_call_details.get("litellm_midstream_failed_hop"):
++            return  # a failed hop of a continued stream; the continuing hop logs the request
+         if not self._is_assembled_stream_success(result) and not self.should_run_logging(
+             event_type="async_success"
+         ):  # prevent double logging (non-streaming)
+@@ -3358,6 +3379,7 @@ class Logging(LiteLLMLoggingBaseClass):
+                 )
+                 self.model_call_details["response_cost"] = None
+ 
++            self._apply_midstream_prior_hops(complete_streaming_response)
+             self._merge_hidden_params_from_response_into_metadata(complete_streaming_response)
+ 
+             await self._prepare_baseline_cache_estimate(complete_streaming_response)
+diff --git a/litellm/litellm_core_utils/streaming_handler.py b/litellm/litellm_core_utils/streaming_handler.py
+index 9d33f86..7a75168 100644
+--- a/litellm/litellm_core_utils/streaming_handler.py
++++ b/litellm/litellm_core_utils/streaming_handler.py
+@@ -2312,8 +2312,27 @@ class CustomStreamWrapper:
+                     pass
+             return None
+ 
++        def _in_stream_error_code(exc: Exception) -> int | None:
++            """Status carried by an in-stream SSE error event (`{"error": {"code": ...}}`),
++            which arrives on a 200 response and so has no HTTP status of its own."""
++            body: Final[object] = getattr(exc, "body", None)
++            candidates: Final = [getattr(exc, "code", None)]
++            if isinstance(body, dict):
++                candidates.append(body.get("code"))
++                nested = body.get("error")
++                if isinstance(nested, dict):
++                    candidates.append(nested.get("code"))
++            for candidate in candidates:
++                try:
++                    if candidate is not None and not isinstance(candidate, bool):
++                        return int(candidate)
++                except (TypeError, ValueError):
++                    continue
++            return None
++
+         mapped_status_code: Final = _normalize_status_code(mapped_exception)
+         original_status_code: Final = _normalize_status_code(e)
++        in_stream_error_code: Final = _in_stream_error_code(e)
+ 
+         # Raise non-retriable client errors directly (skip fallback).
+         # Exception: 429 (rate-limit) IS retriable/transient — allow it
+@@ -2322,6 +2341,8 @@ class CustomStreamWrapper:
+             raise mapped_exception
+         if original_status_code is not None and 400 <= original_status_code < 500 and original_status_code != 429:
+             raise mapped_exception
++        if in_stream_error_code is not None and 400 <= in_stream_error_code < 500 and in_stream_error_code != 429:
++            raise mapped_exception
+ 
+         raise MidStreamFallbackError(
+             message=str(mapped_exception),
+diff --git a/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py b/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py
+index 417017c..0b9c9ad 100644
+--- a/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py
++++ b/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py
+@@ -361,9 +361,13 @@ class AnthropicMessagesStreamingResponse:
+         self,
+         completion_stream: AsyncIterator[bytes],
+         hidden_params: AnthropicMessagesStreamHiddenParams,
++        litellm_logging_obj: object = None,
+     ) -> None:
+         self.completion_stream = completion_stream
+         self._hidden_params = hidden_params
++        # The logging object of the request that produced this stream (used to fold earlier
++        # hops of a continued stream into its single success record).
++        self.litellm_logging_obj = litellm_logging_obj
+ 
+     @property
+     def has_buffered_provider_output(self) -> bool:
+diff --git a/litellm/llms/custom_httpx/llm_http_handler.py b/litellm/llms/custom_httpx/llm_http_handler.py
+index 7dd3b9b..867783d 100644
+--- a/litellm/llms/custom_httpx/llm_http_handler.py
++++ b/litellm/llms/custom_httpx/llm_http_handler.py
+@@ -2239,6 +2239,7 @@ class BaseLLMHTTPHandler:
+                 return AnthropicMessagesStreamingResponse(
+                     completion_stream=completion_stream,
+                     hidden_params=stream_hidden_params,
++                    litellm_logging_obj=logging_obj,
+                 )
+ 
+             from litellm.llms.anthropic.pass_through.messages.agentic_streaming_iterator import (
+@@ -2265,6 +2266,7 @@ class BaseLLMHTTPHandler:
+             return AnthropicMessagesStreamingResponse(
+                 completion_stream=initial_response,
+                 hidden_params=stream_hidden_params,
++                litellm_logging_obj=logging_obj,
+             )
+         else:
+             initial_response = anthropic_messages_provider_config.transform_anthropic_messages_response(
+diff --git a/litellm/router.py b/litellm/router.py
+index 0b9f12c..7c6af00 100644
+--- a/litellm/router.py
++++ b/litellm/router.py
+@@ -2575,6 +2575,7 @@ class Router:
+     def _completion(self, model: str, messages: list[dict[str, str]], **kwargs) -> ModelResponse | CustomStreamWrapper:
+         model_name = None
+         deployment = None
++        midstream_hop: Final = kwargs.pop("litellm_midstream_hop", False) is True
+         try:
+             # Capture kwargs before deployment selection so the streaming
+             # fallback iterator can re-dispatch with the original model group.
+@@ -2667,6 +2668,7 @@ class Router:
+                     model_response=response,
+                     messages=messages,
+                     initial_kwargs=input_kwargs_for_streaming_fallback,
++                    passthrough=midstream_hop,
+                 )
+ 
+             return response
+@@ -2873,6 +2875,154 @@ class Router:
+         combined_usage: Final = BaseTokenUsageProcessor.combine_usage_objects(usage_objects=usage_objects)
+         setattr(fallback_item, "usage", combined_usage)
+ 
++    # ---- mid-stream continuation -------------------------------------------------
++    # A chat-completion stream that dies after delivering text is continued on the
++    # next fallback group: that group receives the original messages plus one
++    # assistant message holding every character already delivered, and its output
++    # is spliced into the same client stream. Each hop that delivered text is billed
++    # once, and the client sees one stream id, one role, one finish and one usage.
++
++    MIDSTREAM_PRIOR_HOPS_KEY: Final = "litellm_midstream_prior_hops"
++
++    @staticmethod
++    def _midstream_chunk_text(item: object) -> str:
++        if not isinstance(item, ModelResponseStream) or not item.choices:
++            return ""
++        delta: Final = getattr(item.choices[0], "delta", None)
++        content: Final = getattr(delta, "content", None)
++        return content if isinstance(content, str) else ""
++
++    @staticmethod
++    def _midstream_new_state() -> dict[str, Any]:
++        return {"id": None, "role_sent": False, "prior": []}
++
++    @staticmethod
++    def _midstream_apply_envelope(item: object, state: dict[str, Any]) -> None:
++        """Make a chunk from any hop look like part of the first hop's stream."""
++        if not isinstance(item, ModelResponseStream):
++            return
++        if state["id"] is None:
++            state["id"] = item.id
++        else:
++            item.id = state["id"]
++        for choice in item.choices or []:
++            delta = getattr(choice, "delta", None)
++            if delta is not None and getattr(delta, "role", None):
++                if state["role_sent"]:
++                    delta.role = None
++                else:
++                    state["role_sent"] = True
++        usage: Final = getattr(item, "usage", None)
++        if usage is not None and state["prior"]:
++            Router._midstream_add_prior_usage(usage, state["prior"])
++
++    @staticmethod
++    def _midstream_add_prior_usage(usage: Any, prior: list[tuple[Usage, float]]) -> None:
++        prompt: Final = sum(hop_usage.prompt_tokens or 0 for hop_usage, _ in prior)
++        completion: Final = sum(hop_usage.completion_tokens or 0 for hop_usage, _ in prior)
++        usage.prompt_tokens = (usage.prompt_tokens or 0) + prompt
++        usage.completion_tokens = (usage.completion_tokens or 0) + completion
++        usage.total_tokens = (usage.total_tokens or 0) + prompt + completion
++        existing_cost: Final = getattr(usage, "cost", None)
++        if existing_cost is not None:
++            setattr(usage, "cost", existing_cost + sum(cost for _, cost in prior))
++
++    def _midstream_fallback_chain(self, initial_kwargs: dict, model_group: str) -> list[str]:
++        fallbacks: Final = initial_kwargs.get("fallbacks", self.fallbacks) or []
++        if not fallbacks or _check_non_standard_fallback_format(fallbacks=fallbacks):
++            return []
++        groups, generic_idx = get_fallback_model_group_for_lookup_groups(
++            fallbacks=fallbacks,
++            lookup_groups=fallback_lookup_groups(initial_kwargs, model_group),
++        )
++        if groups is None and generic_idx is not None:
++            groups = fallbacks[generic_idx]["*"]
++        return [group for group in (groups or []) if isinstance(group, str) and group != model_group]
++
++    def _midstream_hop_usage(self, hop_response: object, hop_messages: list, hop_text: str) -> tuple[Usage, float]:
++        """Usage and cost of a hop that died after delivering `hop_text`."""
++        hidden: Final = getattr(hop_response, "_hidden_params", None) or {}
++        model_id: Final = hidden.get("model_id")
++        deployment: Final = self.get_deployment(model_id=model_id) if model_id else None
++        params: Final[dict[str, Any]] = deployment.litellm_params.model_dump() if deployment is not None else {}
++        model: Final = params.get("model") or getattr(hop_response, "model", None) or ""
++        prompt_tokens: Final = litellm.token_counter(model=model, messages=hop_messages)
++        completion_tokens: Final = litellm.token_counter(model=model, text=hop_text)
++        input_cost, output_cost = params.get("input_cost_per_token"), params.get("output_cost_per_token")
++        if input_cost is not None or output_cost is not None:
++            cost = prompt_tokens * float(input_cost or 0.0) + completion_tokens * float(output_cost or 0.0)
++        else:
++            try:
++                prompt_cost, completion_cost = litellm.cost_per_token(
++                    model=model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
++                )
++                cost = prompt_cost + completion_cost
++            except Exception:  # noqa: BLE001  # unknown pricing must not break the stream
++                cost = 0.0
++        usage: Final = Usage(
++            prompt_tokens=prompt_tokens,
++            completion_tokens=completion_tokens,
++            total_tokens=prompt_tokens + completion_tokens,
++        )
++        return usage, cost
++
++    def _midstream_supports_prefill(self, group: str) -> bool:
++        """False when a deployment of `group` declares model_info.supports_assistant_prefill = False."""
++        for deployment in self.get_model_list(model_name=group) or []:
++            model_info = deployment.get("model_info") or {}
++            if model_info.get("supports_assistant_prefill") is False:
++                return False
++        return True
++
++    def _midstream_hop_request(
++        self, initial_kwargs: dict, group: str, messages: list, delivered: str
++    ) -> tuple[list, dict, str]:
++        """Messages and kwargs for continuing on `group`, plus the text its output will repeat.
++
++        A group that supports assistant prefill receives the delivered text as a final assistant
++        message and continues after it. A group that does not receives the original messages and
++        answers from the start, so the already-delivered text is returned to be skipped.
++        """
++        prefill: Final = bool(delivered) and self._midstream_supports_prefill(group)
++        hop_messages: Final = list(messages) + ([{"role": "assistant", "content": delivered}] if prefill else [])
++        hop_kwargs: Final = {
++            key: value
++            for key, value in initial_kwargs.items()
++            if key not in ("model", "messages", "original_function", "fallbacks")
++        }
++        hop_kwargs["litellm_midstream_hop"] = True
++        return hop_messages, hop_kwargs, (delivered if delivered and not prefill else "")
++
++    @staticmethod
++    def _midstream_trim_repeated(piece: str, skip: str) -> tuple[str, str]:
++        """(remaining text to skip, part of `piece` after the repeated text)."""
++        overlap: Final = min(len(piece), len(skip))
++        if piece[:overlap] != skip[:overlap]:
++            raise ValueError("Fallback output diverged from the text already delivered to the caller")
++        return skip[overlap:], piece[overlap:]
++
++    @staticmethod
++    def _midstream_set_chunk_text(item: object, text: str) -> None:
++        if isinstance(item, ModelResponseStream) and item.choices:
++            delta = getattr(item.choices[0], "delta", None)
++            if delta is not None:
++                delta.content = text
++
++    @staticmethod
++    def _midstream_mark_prior(hop_response: object, prior: list[tuple[Usage, float]]) -> None:
++        logging_obj: Final = getattr(hop_response, "logging_obj", None)
++        details: Final = getattr(logging_obj, "model_call_details", None)
++        if isinstance(details, dict) and prior:
++            details[Router.MIDSTREAM_PRIOR_HOPS_KEY] = list(prior)
++
++    @staticmethod
++    def _midstream_terminal_error(error: Exception) -> Exception:
++        from litellm.exceptions import MidStreamFallbackError
++
++        if isinstance(error, MidStreamFallbackError) and error.original_exception is not None:
++            return error.original_exception
++        return error
++
+     @staticmethod
+     def _prepare_fallback_hidden_params(
+         fallback_response: object,
+@@ -2921,6 +3071,7 @@ class Router:
+         messages: list[dict[str, str]],
+         initial_kwargs: dict,
+         deployment_slot: contextlib.AsyncExitStack | None = None,
++        passthrough: bool = False,
+     ) -> CustomStreamWrapper:
+         """
+         Helper to iterate over a streaming response.
+@@ -2969,107 +3120,81 @@ class Router:
+                     e,
+                 )
+ 
+-        async def stream_with_fallbacks():
+-            fallback_response = None  # Track for cleanup in finally
++        async def close_stream(stream: object) -> None:
++            if stream is None or not hasattr(stream, "aclose"):
++                return
+             try:
+-                async for item in model_response:
+-                    yield item
+-            except MidStreamFallbackError as e:
+-                with anyio.CancelScope(shield=True):
+-                    await close_model_response()
+-                    await held_slot.aclose()
+-                if not e.is_pre_first_chunk and (
+-                    e.generated_content or _stream_chunks_have_generated_content(model_response.chunks)
+-                ):
+-                    if e.original_exception is not None:
+-                        raise e.original_exception from e
+-                    raise
+-
+-                from litellm.main import stream_chunk_builder
++                await stream.aclose()  # pyright: ignore[reportAttributeAccessIssue]
++            except BaseException as e:
++                verbose_router_logger.debug("stream_with_fallbacks: error closing stream: %s", e)
+ 
+-                complete_response_object: Final = stream_chunk_builder(chunks=model_response.chunks)
+-                complete_response_object_usage: Final = cast(
+-                    Usage | None,
+-                    getattr(complete_response_object, "usage", None),
+-                )
++        async def stream_with_fallbacks():
++            if passthrough:
++                # A continuation hop: its failures belong to the outer stream's loop.
+                 try:
+-                    # Use the router's fallback system
+-                    model_group: Final = cast(str, initial_kwargs.get("model"))
+-                    fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", self.fallbacks)
+-                    context_window_fallbacks: Final[list | None] = initial_kwargs.get(
+-                        "context_window_fallbacks", self.context_window_fallbacks
+-                    )
+-                    content_policy_fallbacks: Final[list | None] = initial_kwargs.get(
+-                        "content_policy_fallbacks", self.content_policy_fallbacks
+-                    )
+-                    initial_kwargs["original_function"] = self._acompletion
+-                    initial_kwargs["messages"] = messages
+-                    self._update_kwargs_before_fallbacks(model=model_group, kwargs=initial_kwargs)
+-                    fallback_response = await self.async_function_with_fallbacks_common_utils(
+-                        e=e,
+-                        disable_fallbacks=fallbacks_disabled_for_request(initial_kwargs),
+-                        fallbacks=fallbacks,
+-                        context_window_fallbacks=context_window_fallbacks,
+-                        content_policy_fallbacks=content_policy_fallbacks,
+-                        model_group=model_group,
+-                        args=(),
+-                        kwargs=initial_kwargs,
+-                        include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+-                    )
++                    async for item in model_response:
++                        yield item
++                finally:
++                    with anyio.CancelScope(shield=True):
++                        await close_model_response()
++                        await held_slot.aclose()
++                return
+ 
+-                    # If fallback returns a streaming response, iterate over it
+-                    if hasattr(fallback_response, "__aiter__"):
+-                        prepared_fallback_hidden_params = Router._adopt_fallback_response_headers(
+-                            wrapper_ref, fallback_response
+-                        )
+-                        fallback_headers_are_settled = False
+-                        async for fallback_item in fallback_response:
+-                            if not fallback_headers_are_settled:
+-                                fallback_headers_are_settled = True
+-                                # a fallback that failed over again only repoints itself once it yields
+-                                prepared_fallback_hidden_params = Router._adopt_fallback_response_headers(
+-                                    wrapper_ref, fallback_response
+-                                )
+-                            Router._apply_fallback_hidden_params_to_item(fallback_item, prepared_fallback_hidden_params)
+-                            if (
+-                                fallback_item
+-                                and isinstance(fallback_item, ModelResponseStream)
+-                                and hasattr(fallback_item, "usage")
+-                            ):
+-                                self._combine_fallback_usage(fallback_item, complete_response_object_usage)
+-                            yield fallback_item
+-                    else:
+-                        # If fallback returns a non-streaming response, yield None
+-                        yield None
+-
+-                except Exception as fallback_error:
+-                    # If fallback also fails, log and re-raise original error
+-                    verbose_router_logger.error("Fallback also failed: %s", fallback_error)
+-                    # No fallback handled the mid-stream error, so surface the
+-                    # real provider exception (e.g. RateLimitError) instead of
+-                    # leaking the internal MidStreamFallbackError to the client
+-                    if (
+-                        isinstance(fallback_error, MidStreamFallbackError)
+-                        and fallback_error.original_exception is not None
+-                    ):
+-                        raise fallback_error.original_exception from fallback_error
+-                    raise fallback_error
++            model_group: Final = cast(str, initial_kwargs.get("model"))
++            state: Final = Router._midstream_new_state()
++            current: object = model_response
++            current_messages: list = list(messages)
++            delivered, skip = "", ""
++            chain: list[str] | None = None
++            try:
++                while True:
++                    hop_text, hop_forwarded = "", ""
++                    try:
++                        async for item in current:  # pyright: ignore[reportGeneralTypeIssues]
++                            Router._midstream_apply_envelope(item, state)
++                            piece = Router._midstream_chunk_text(item)
++                            hop_text += piece
++                            if skip and piece:
++                                skip, piece = Router._midstream_trim_repeated(piece, skip)
++                                Router._midstream_set_chunk_text(item, piece)
++                            hop_forwarded += piece
++                            yield item
++                        return
++                    except MidStreamFallbackError as e:
++                        with anyio.CancelScope(shield=True):
++                            await close_stream(current)
++                            if current is model_response:
++                                await held_slot.aclose()
++                        delivered += hop_forwarded
++                        if hop_text:
++                            state["prior"].append(self._midstream_hop_usage(current, current_messages, hop_text))
++                        if fallbacks_disabled_for_request(initial_kwargs):
++                            raise Router._midstream_terminal_error(e) from e
++                        if chain is None:
++                            chain = self._midstream_fallback_chain(initial_kwargs, model_group)
++                        last_error: Exception = e
++                        current = None
++                        while chain and current is None:
++                            group = chain.pop(0)
++                            hop_messages, hop_kwargs, hop_skip = self._midstream_hop_request(
++                                initial_kwargs, group, messages, delivered
++                            )
++                            try:
++                                current = await self._acompletion(model=group, messages=hop_messages, **hop_kwargs)
++                                current_messages, skip = hop_messages, hop_skip
++                            except Exception as call_error:  # noqa: BLE001  # try the next group
++                                last_error = call_error
++                        if current is None:
++                            verbose_router_logger.error("Mid-stream fallback exhausted: %s", last_error)
++                            raise Router._midstream_terminal_error(last_error) from e
++                        Router._adopt_fallback_response_headers(wrapper_ref, current)
++                        Router._midstream_mark_prior(current, state["prior"])
+             finally:
+-                # Close the underlying streams to release HTTP connections
+-                # back to the connection pool when the generator is closed
+-                # (e.g. on client disconnect).
+-                # Shield from anyio cancellation so the awaits can complete.
+                 with anyio.CancelScope(shield=True):
++                    if current is not model_response:
++                        await close_stream(current)
+                     await close_model_response()
+                     await held_slot.aclose()
+-                    if fallback_response is not None and hasattr(fallback_response, "aclose"):
+-                        try:
+-                            await fallback_response.aclose()
+-                        except BaseException as e:
+-                            verbose_router_logger.debug(
+-                                "stream_with_fallbacks: error closing fallback_response: %s",
+-                                e,
+-                            )
+ 
+         wrapped_response: Final = FallbackStreamWrapper(stream_with_fallbacks())
+         # weak, so the generator closing over it does not keep the wrapper out of
+@@ -3545,6 +3670,7 @@ class Router:
+         model_response: CustomStreamWrapper,
+         messages: list[dict[str, str]],
+         initial_kwargs: dict,
++        passthrough: bool = False,
+     ) -> CustomStreamWrapper:
+         """
+         Sync equivalent of _acompletion_streaming_iterator.
+@@ -3576,96 +3702,74 @@ class Router:
+ 
+         router_self: Final = self
+ 
+-        def stream_with_fallbacks():
+-            fallback_response = None
++        def close_stream(stream: object) -> None:
++            if stream is None or not hasattr(stream, "close"):
++                return
+             try:
+-                for item in model_response:
+-                    yield item
+-            except MidStreamFallbackError as e:
+-                if fallbacks_disabled_for_request(initial_kwargs) or (
+-                    not e.is_pre_first_chunk
+-                    and (e.generated_content or _stream_chunks_have_generated_content(model_response.chunks))
+-                ):
+-                    if e.original_exception is not None:
+-                        raise e.original_exception from e
+-                    raise
+-
+-                from litellm.main import stream_chunk_builder
++                stream.close()  # pyright: ignore[reportAttributeAccessIssue]
++            except BaseException as close_err:
++                verbose_router_logger.debug("stream_with_fallbacks: error closing stream: %s", close_err)
+ 
+-                complete_response_object: Final = stream_chunk_builder(chunks=model_response.chunks)
+-                complete_response_object_usage: Final = cast(
+-                    Usage | None,
+-                    getattr(complete_response_object, "usage", None),
+-                )
++        def stream_with_fallbacks():
++            if passthrough:
++                # A continuation hop: its failures belong to the outer stream's loop.
+                 try:
+-                    model_group: Final = cast(str, initial_kwargs.get("model"))
+-                    fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", router_self.fallbacks)
+-                    context_window_fallbacks: Final[list | None] = initial_kwargs.get(
+-                        "context_window_fallbacks",
+-                        router_self.context_window_fallbacks,
+-                    )
+-                    content_policy_fallbacks: Final[list | None] = initial_kwargs.get(
+-                        "content_policy_fallbacks",
+-                        router_self.content_policy_fallbacks,
+-                    )
+-                    initial_kwargs["original_function"] = router_self._completion
+-                    initial_kwargs["messages"] = messages
+-                    router_self._update_kwargs_before_fallbacks(model=model_group, kwargs=initial_kwargs)
+-                    fallback_response = router_self.function_with_fallbacks(
+-                        **initial_kwargs,
+-                        fallbacks=fallbacks,
+-                        context_window_fallbacks=context_window_fallbacks,
+-                        content_policy_fallbacks=content_policy_fallbacks,
+-                    )
+-
+-                    if hasattr(fallback_response, "__iter__"):
+-                        prepared_fallback_hidden_params = Router._adopt_fallback_response_headers(
+-                            wrapper_ref, fallback_response
+-                        )
+-                        fallback_headers_are_settled = False
+-                        for fallback_item in fallback_response:
+-                            if not fallback_headers_are_settled:
+-                                fallback_headers_are_settled = True
+-                                # a fallback that failed over again only repoints itself once it yields
+-                                prepared_fallback_hidden_params = Router._adopt_fallback_response_headers(
+-                                    wrapper_ref, fallback_response
+-                                )
+-                            Router._apply_fallback_hidden_params_to_item(fallback_item, prepared_fallback_hidden_params)
+-                            if (
+-                                fallback_item
+-                                and isinstance(fallback_item, ModelResponseStream)
+-                                and hasattr(fallback_item, "usage")
+-                            ):
+-                                router_self._combine_fallback_usage(fallback_item, complete_response_object_usage)
+-                            yield fallback_item
+-                    else:
+-                        yield None
++                    for item in model_response:
++                        yield item
++                finally:
++                    close_stream(model_response)
++                return
+ 
+-                except Exception as fallback_error:
+-                    verbose_router_logger.error("Fallback also failed: %s", fallback_error)
+-                    if (
+-                        isinstance(fallback_error, MidStreamFallbackError)
+-                        and fallback_error.original_exception is not None
+-                    ):
+-                        raise fallback_error.original_exception from fallback_error
+-                    raise fallback_error
+-            finally:
+-                if hasattr(model_response, "close"):
+-                    try:
+-                        model_response.close()
+-                    except BaseException as close_err:
+-                        verbose_router_logger.debug(
+-                            "stream_with_fallbacks: error closing model_response: %s",
+-                            close_err,
+-                        )
+-                if fallback_response is not None and hasattr(fallback_response, "close"):
++            model_group: Final = cast(str, initial_kwargs.get("model"))
++            state: Final = Router._midstream_new_state()
++            current: object = model_response
++            current_messages: list = list(messages)
++            delivered, skip = "", ""
++            chain: list[str] | None = None
++            try:
++                while True:
++                    hop_text, hop_forwarded = "", ""
+                     try:
+-                        fallback_response.close()
+-                    except BaseException as close_err:
+-                        verbose_router_logger.debug(
+-                            "stream_with_fallbacks: error closing fallback_response: %s",
+-                            close_err,
+-                        )
++                        for item in current:  # pyright: ignore[reportGeneralTypeIssues]
++                            Router._midstream_apply_envelope(item, state)
++                            piece = Router._midstream_chunk_text(item)
++                            hop_text += piece
++                            if skip and piece:
++                                skip, piece = Router._midstream_trim_repeated(piece, skip)
++                                Router._midstream_set_chunk_text(item, piece)
++                            hop_forwarded += piece
++                            yield item
++                        return
++                    except MidStreamFallbackError as e:
++                        close_stream(current)
++                        delivered += hop_forwarded
++                        if hop_text:
++                            state["prior"].append(router_self._midstream_hop_usage(current, current_messages, hop_text))
++                        if fallbacks_disabled_for_request(initial_kwargs):
++                            raise Router._midstream_terminal_error(e) from e
++                        if chain is None:
++                            chain = router_self._midstream_fallback_chain(initial_kwargs, model_group)
++                        last_error: Exception = e
++                        current = None
++                        while chain and current is None:
++                            group = chain.pop(0)
++                            hop_messages, hop_kwargs, hop_skip = router_self._midstream_hop_request(
++                                initial_kwargs, group, messages, delivered
++                            )
++                            try:
++                                current = router_self._completion(model=group, messages=hop_messages, **hop_kwargs)
++                                current_messages, skip = hop_messages, hop_skip
++                            except Exception as call_error:  # noqa: BLE001  # try the next group
++                                last_error = call_error
++                        if current is None:
++                            verbose_router_logger.error("Mid-stream fallback exhausted: %s", last_error)
++                            raise Router._midstream_terminal_error(last_error) from e
++                        Router._adopt_fallback_response_headers(wrapper_ref, current)
++                        Router._midstream_mark_prior(current, state["prior"])
++            finally:
++                if current is not model_response:
++                    close_stream(current)
++                close_stream(model_response)
+ 
+         wrapped_response: Final = SyncFallbackStreamWrapper(stream_with_fallbacks())
+         # weak, for the same reason as the async twin
+@@ -3706,6 +3810,7 @@ class Router:
+         model_name = None
+         deployment = None
+         _timeout_debug_deployment_dict = {}  # this is a temporary dict to debug timeout issues
++        midstream_hop: Final = kwargs.pop("litellm_midstream_hop", False) is True
+         try:
+             input_kwargs_for_streaming_fallback: Final = kwargs.copy()
+             input_kwargs_for_streaming_fallback["model"] = model
+@@ -3834,6 +3939,7 @@ class Router:
+                         messages=messages,
+                         initial_kwargs=input_kwargs_for_streaming_fallback,
+                         deployment_slot=deployment_slot.pop_all(),
++                        passthrough=midstream_hop,
+                     )
+ 
+                 return response
+@@ -5769,11 +5875,172 @@ class Router:
+         (see _ageneric_api_call_with_fallbacks_anthropic_messages_attempt). Parity with
+         _aresponses_with_streaming_fallbacks for the Responses API.
+         """
+-        return await self._ageneric_api_call_with_fallbacks(
+-            original_function=original_function,
+-            attempt_function=self._ageneric_api_call_with_fallbacks_anthropic_messages_attempt,
+-            **kwargs,
+-        )
++        midstream_hop: Final = kwargs.pop("litellm_midstream_hop", False) is True
++        if midstream_hop or not kwargs.get("stream"):
++            return await self._ageneric_api_call_with_fallbacks(
++                original_function=original_function,
++                attempt_function=self._ageneric_api_call_with_fallbacks_anthropic_messages_attempt,
++                **kwargs,
++            )
++        return await self._aanthropic_messages_continuing_stream(original_function, dict(kwargs))
++
++    # Anthropic stream errors after which the next fallback group continues the message.
++    ANTHROPIC_CONTINUABLE_ERRORS: Final = frozenset({"api_error", "overloaded_error", "rate_limit_error"})
++
++    @staticmethod
++    def _anthropic_sse_event(raw: bytes) -> tuple[str | None, dict]:
++        name, data = None, {}
++        for line in raw.decode("utf-8", errors="replace").splitlines():
++            if line.startswith("event:"):
++                name = line[6:].strip()
++            elif line.startswith("data:"):
++                try:
++                    data = json.loads(line[5:].strip())
++                except ValueError:
++                    data = {}
++        if name is None and isinstance(data, dict):
++            name = data.get("type")
++        return name, data if isinstance(data, dict) else {}
++
++    @staticmethod
++    def _anthropic_sse_bytes(name: str, data: dict) -> bytes:
++        return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
++
++    @staticmethod
++    def _midstream_logging_target(stream: object, depth: int = 0) -> object:
++        """The object whose `logging_obj`/`litellm_logging_obj` logs this stream's success."""
++        if stream is None or depth > 4:
++            return None
++        if getattr(stream, "litellm_logging_obj", None) is not None or getattr(stream, "logging_obj", None) is not None:
++            return stream
++        for attribute in ("_source_iterator", "_response_iterator", "completion_stream"):
++            found = Router._midstream_logging_target(getattr(stream, attribute, None), depth + 1)
++            if found is not None:
++                return found
++        return None
++
++    @staticmethod
++    def _midstream_mark_prior_anthropic(stream: object, prior: list[tuple[Usage, float]]) -> None:
++        target = Router._midstream_logging_target(stream)
++        logging_obj = getattr(target, "litellm_logging_obj", None) or getattr(target, "logging_obj", None)
++        details = getattr(logging_obj, "model_call_details", None)
++        if isinstance(details, dict) and prior:
++            details[Router.MIDSTREAM_PRIOR_HOPS_KEY] = list(prior)
++
++    @staticmethod
++    def _midstream_mark_failed_anthropic(stream: object) -> None:
++        """A hop that failed and was continued elsewhere must not log a success of its own."""
++        target = Router._midstream_logging_target(stream)
++        logging_obj = getattr(target, "litellm_logging_obj", None) or getattr(target, "logging_obj", None)
++        details = getattr(logging_obj, "model_call_details", None)
++        if isinstance(details, dict):
++            details["litellm_midstream_failed_hop"] = True
++
++    async def _aanthropic_messages_continuing_stream(self, original_function: Callable, kwargs: dict[str, Any]):
++        """A /v1/messages stream that continues on the next fallback group after a provider failure."""
++        model_group: Final = cast(str, kwargs.get("model"))
++        messages: Final = list(cast(list, kwargs.get("messages") or []))
++        groups: list[str] = [model_group] + (
++            [] if fallbacks_disabled_for_request(kwargs) else self._midstream_fallback_chain(kwargs, model_group)
++        )
++        base: Final = {key: value for key, value in kwargs.items() if key not in ("model", "messages", "fallbacks")}
++        base["disable_fallbacks"] = True
++        base["litellm_midstream_hop"] = True
++
++        async def open_next(delivered: str) -> tuple[object, list, str]:
++            """(stream, messages sent, text the stream will repeat) for the next available group."""
++            last_error: Exception | None = None
++            while groups:
++                group = groups.pop(0)
++                prefill = bool(delivered) and self._midstream_supports_prefill(group)
++                hop_messages = messages + ([{"role": "assistant", "content": delivered}] if prefill else [])
++                try:
++                    stream = await self._aanthropic_messages_with_streaming_fallbacks(
++                        original_function, model=group, messages=hop_messages, **base
++                    )
++                    return stream, hop_messages, (delivered if delivered and not prefill else "")
++                except Exception as call_error:  # noqa: BLE001  # try the next group
++                    last_error = call_error
++            raise last_error if last_error is not None else ValueError("no deployment available")
++
++        first, _, _ = await open_next("")
++        router_self: Final = self
++
++        async def continuing() -> AsyncGenerator[bytes, None]:
++            started, block_started, delivered, skip = False, False, "", ""
++            prior: list[tuple[Usage, float]] = []
++            current, current_messages = first, messages
++            try:
++                while True:
++                    hop_text, hop_forwarded, buffer, failure = "", "", b"", None
++                    try:
++                        async for chunk in current:  # pyright: ignore[reportGeneralTypeIssues]
++                            buffer += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode()
++                            while failure is None:
++                                end = buffer.find(b"\n\n")
++                                if end < 0:
++                                    break
++                                raw, buffer = buffer[: end + 2], buffer[end + 2 :]
++                                name, data = Router._anthropic_sse_event(raw)
++                                if name == "error":
++                                    error_type = (data.get("error") or {}).get("type")
++                                    if error_type in Router.ANTHROPIC_CONTINUABLE_ERRORS and groups:
++                                        failure = raw
++                                        break
++                                    yield raw
++                                    continue
++                                if name == "message_start":
++                                    if started:
++                                        continue
++                                    started = True
++                                elif name == "content_block_start" and data.get("index", 0) == 0:
++                                    if block_started:
++                                        continue
++                                    block_started = True
++                                elif name == "content_block_delta":
++                                    piece = (data.get("delta") or {}).get("text") or ""
++                                    hop_text += piece
++                                    if skip and piece:
++                                        skip, piece = Router._midstream_trim_repeated(piece, skip)
++                                        data["delta"]["text"] = piece
++                                        raw = Router._anthropic_sse_bytes(name, data)
++                                    hop_forwarded += piece
++                                elif name == "message_delta" and prior:
++                                    usage = data.setdefault("usage", {})
++                                    usage["output_tokens"] = (usage.get("output_tokens") or 0) + sum(
++                                        hop_usage.completion_tokens or 0 for hop_usage, _ in prior
++                                    )
++                                    raw = Router._anthropic_sse_bytes(name, data)
++                                yield raw
++                            if failure is not None:
++                                break
++                        if failure is None:
++                            if buffer:
++                                yield buffer
++                            return
++                    except Exception as stream_error:  # noqa: BLE001  # provider failure mid-stream
++                        if not groups:
++                            raise
++                        failure = stream_error
++                    Router._midstream_mark_failed_anthropic(current)
++                    with anyio.CancelScope(shield=True), contextlib.suppress(BaseException):
++                        await current.aclose()  # pyright: ignore[reportAttributeAccessIssue]
++                    delivered += hop_forwarded
++                    if hop_text:
++                        prior.append(router_self._midstream_hop_usage(current, current_messages, hop_text))
++                    try:
++                        current, current_messages, skip = await open_next(delivered)
++                    except Exception:
++                        if isinstance(failure, bytes):
++                            yield failure
++                            return
++                        raise failure from None
++                    Router._midstream_mark_prior_anthropic(current, prior)
++            finally:
++                with anyio.CancelScope(shield=True), contextlib.suppress(BaseException):
++                    await current.aclose()  # pyright: ignore[reportAttributeAccessIssue]
++
++        return FallbackAwareAnthropicMessagesStream(continuing(), first)
+ 
+     async def _ageneric_api_call_with_fallbacks_anthropic_messages_attempt(
+         self,
