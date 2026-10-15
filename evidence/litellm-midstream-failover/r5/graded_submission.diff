@@ -1,0 +1,1883 @@
+diff -ruN -x __pycache__ -x *.pyc litellm/litellm_core_utils/litellm_logging.py submission/litellm/litellm_core_utils/litellm_logging.py
+--- litellm/litellm_core_utils/litellm_logging.py	2026-10-05 21:12:19
++++ submission/litellm/litellm_core_utils/litellm_logging.py	2026-10-15 15:53:25
+@@ -2454,6 +2454,11 @@
+         self, init_response_obj: object, start_time: dt_object, end_time: dt_object
+     ) -> StandardLoggingPayload | None:
+         """Build StandardLoggingPayload and accumulate its construction time."""
++        from litellm.router_utils.midstream_continuation import apply_billing_extras
++
++        # A stream the Router continued on another deployment bills one request across
++        # several provider requests; the hop that finished it reports all of them.
++        apply_billing_extras(self.model_call_details, init_response_obj)
+         _start: Final = time.time()
+         payload: Final = get_standard_logging_object_payload(
+             kwargs=self.model_call_details,
+diff -ruN -x __pycache__ -x *.pyc litellm/litellm_core_utils/streaming_handler.py submission/litellm/litellm_core_utils/streaming_handler.py
+--- litellm/litellm_core_utils/streaming_handler.py	2026-10-05 21:12:19
++++ submission/litellm/litellm_core_utils/streaming_handler.py	2026-10-15 15:54:50
+@@ -7,6 +7,7 @@
+ import time
+ import traceback
+ from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
++from contextlib import suppress
+ from dataclasses import dataclass
+ from types import MappingProxyType
+ from typing import Any, Final, NoReturn, Protocol, TypeVar, cast
+@@ -2314,14 +2315,22 @@
+ 
+         mapped_status_code: Final = _normalize_status_code(mapped_exception)
+         original_status_code: Final = _normalize_status_code(e)
++        # An in-stream `data: {"error": {"code": ...}}` event carries its status in the
++        # payload, not on the exception: the SDK surfaces it as a bare APIError, which maps
++        # to a generic 500 and would hide a 400 behind a fallback (or a 429 behind a
++        # non-retriable 4xx). The event's own code is what decides, and the exception the
++        # caller sees carries it too.
++        event_status_code: Final = _in_stream_error_event_status_code(e)
++        resolved_status_code: Final = event_status_code or mapped_status_code or original_status_code
++        if event_status_code is not None:
++            with suppress(AttributeError):
++                mapped_exception.status_code = event_status_code  # pyright: ignore[reportAttributeAccessIssue]  # OpenAI-shaped exceptions all carry status_code
+ 
+         # Raise non-retriable client errors directly (skip fallback).
+         # Exception: 429 (rate-limit) IS retriable/transient — allow it
+         # through so the Router can switch to a different model group.
+-        if mapped_status_code is not None and 400 <= mapped_status_code < 500 and mapped_status_code != 429:
++        if resolved_status_code is not None and 400 <= resolved_status_code < 500 and resolved_status_code != 429:
+             raise mapped_exception
+-        if original_status_code is not None and 400 <= original_status_code < 500 and original_status_code != 429:
+-            raise mapped_exception
+ 
+         raise MidStreamFallbackError(
+             message=str(mapped_exception),
+@@ -2367,6 +2376,26 @@
+                 return chunk[_length_of_sse_data_prefix:]
+ 
+         return chunk
++
++
++def _in_stream_error_event_status_code(exception: Exception) -> int | None:
++    """The HTTP-shaped code an in-stream `data: {"error": {...}}` event reported, if any.
++
++    Providers end a broken stream with an error event rather than a status line, so the SDK
++    raises a bare ``APIError`` whose ``body``/``code`` is the only place the real code
++    appears. Only plausible status codes count, so a provider's own error enum
++    (``"insufficient_quota"``, ``503.5``) never masquerades as one.
++    """
++    candidates: Final = (getattr(exception, "code", None), (getattr(exception, "body", None) or {}))
++    for candidate in candidates:
++        value = candidate.get("code") if isinstance(candidate, dict) else candidate
++        if isinstance(value, bool):
++            continue
++        if isinstance(value, str) and value.isdigit():
++            value = int(value)
++        if isinstance(value, int) and 400 <= value < 600:
++            return value
++    return None
+ 
+ 
+ def _cache_token_count(details: PromptTokensDetailsWrapper | None, keys: tuple[str, ...]) -> int:
+diff -ruN -x __pycache__ -x *.pyc litellm/llms/anthropic/pass_through/messages/streaming_iterator.py submission/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py
+--- litellm/llms/anthropic/pass_through/messages/streaming_iterator.py	2026-10-05 21:12:19
++++ submission/litellm/llms/anthropic/pass_through/messages/streaming_iterator.py	2026-10-15 15:53:25
+@@ -361,9 +361,13 @@
+         self,
+         completion_stream: AsyncIterator[bytes],
+         hidden_params: AnthropicMessagesStreamHiddenParams,
++        litellm_logging_obj: LiteLLMLoggingObj | None = None,
+     ) -> None:
+         self.completion_stream = completion_stream
+         self._hidden_params = hidden_params
++        # the object that bills this stream: a caller driving the stream itself (the
++        # Router's mid-stream continuation) has to be able to reach it
++        self.litellm_logging_obj = litellm_logging_obj
+ 
+     @property
+     def has_buffered_provider_output(self) -> bool:
+diff -ruN -x __pycache__ -x *.pyc litellm/llms/custom_httpx/llm_http_handler.py submission/litellm/llms/custom_httpx/llm_http_handler.py
+--- litellm/llms/custom_httpx/llm_http_handler.py	2026-10-05 21:12:19
++++ submission/litellm/llms/custom_httpx/llm_http_handler.py	2026-10-15 15:53:25
+@@ -2239,6 +2239,7 @@
+                 return AnthropicMessagesStreamingResponse(
+                     completion_stream=completion_stream,
+                     hidden_params=stream_hidden_params,
++                    litellm_logging_obj=logging_obj,
+                 )
+ 
+             from litellm.llms.anthropic.pass_through.messages.agentic_streaming_iterator import (
+@@ -2265,6 +2266,7 @@
+             return AnthropicMessagesStreamingResponse(
+                 completion_stream=initial_response,
+                 hidden_params=stream_hidden_params,
++                litellm_logging_obj=logging_obj,
+             )
+         else:
+             initial_response = anthropic_messages_provider_config.transform_anthropic_messages_response(
+File litellm/proxy/enterprise is a unknown type while file submission/litellm/proxy/enterprise is a unknown type
+diff -ruN -x __pycache__ -x *.pyc litellm/router.py submission/litellm/router.py
+--- litellm/router.py	2026-10-05 21:12:19
++++ submission/litellm/router.py	2026-10-15 17:27:49
+@@ -227,6 +227,12 @@
+     send_llm_exception_alert,
+ )
+ from litellm.router_utils.health_state_cache import DeploymentHealthCache
++from litellm.router_utils.midstream_continuation import (
++    MIDSTREAM_HOP_KEY,
++    aanthropic_messages_with_continuation,
++    acompletion_with_continuation,
++    completion_with_continuation,
++)
+ from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
+     DeploymentAffinityCheck,
+     warn_on_unknown_model_group_affinity_flags,
+@@ -2560,6 +2566,15 @@
+         Example usage:
+         response = router.completion(model="gpt-3.5-turbo", messages=[{"role": "user", "content": "Hey, how's it going?"}]
+         """
++        if self._midstream_continuation_applies(model=model, stream=kwargs.get("stream") is True, kwargs=kwargs):
++            # sync twin of acompletion's continuation driver (see _midstream_continuation_applies)
++            return completion_with_continuation(router=self, model=model, messages=messages, kwargs=kwargs)
++        return self.completion_attempt(model=model, messages=messages, **kwargs)
++
++    def completion_attempt(
++        self, model: str, messages: list[dict[str, str]], **kwargs
++    ) -> ModelResponse | CustomStreamWrapper:
++        """One provider request of a `completion` call, fallbacks and retries included."""
+         try:
+             verbose_router_logger.debug("router.completion(model=%s,..)", model)
+             kwargs["model"] = model
+@@ -2576,6 +2591,9 @@
+         model_name = None
+         deployment = None
+         try:
++            # One hop of a continued stream: the continuation driver owns the fallback
++            # decision for it, so this attempt hands back the provider's own stream.
++            midstream_hop: Final = kwargs.pop(MIDSTREAM_HOP_KEY, None)
+             # Capture kwargs before deployment selection so the streaming
+             # fallback iterator can re-dispatch with the original model group.
+             input_kwargs_for_streaming_fallback: Final = kwargs.copy()
+@@ -2593,6 +2611,9 @@
+                 model=model,
+                 kwargs=kwargs,
+             )
++            if midstream_hop is not None:
++                midstream_hop.deployment = deployment
++                midstream_hop.model_group = model
+             # Check for silent model experiment
+             # Make a local copy of litellm_params to avoid mutating the Router's state
+             litellm_params: Final = self._deployment_params_with_request_reasoning_override(
+@@ -2663,6 +2684,8 @@
+             # Wrap streaming responses so MidStreamFallbackError (raised
+             # during iteration) triggers the Router's fallback chain.
+             if isinstance(response, CustomStreamWrapper):
++                if midstream_hop is not None:
++                    return response
+                 return self._completion_streaming_iterator(
+                     model_response=response,
+                     messages=messages,
+@@ -2808,6 +2831,35 @@
+         stream: bool = False,
+         **kwargs,
+     ):
++        if self._midstream_continuation_applies(model=model, stream=stream, kwargs=kwargs):
++            # A streamed answer outlives the provider that started it: the continuation
++            # driver walks the request's fallback chain through the stream, so a provider
++            # failing mid-answer costs the caller neither the text already delivered nor
++            # the rest of the answer. See router_utils.midstream_continuation.
++            return await acompletion_with_continuation(router=self, model=model, messages=messages, kwargs=kwargs)
++        return await self.acompletion_attempt(model=model, messages=messages, stream=stream, **kwargs)
++
++    def _midstream_continuation_applies(self, model: str, stream: bool, kwargs: Mapping[str, Any]) -> bool:
++        """Whether a request's stream is driven hop by hop by the continuation driver.
++
++        Only streams, and only the plain chat path: prompt-management models and priority
++        scheduling re-enter through their own factories, which the driver does not model.
++        """
++        if stream is not True or kwargs.get(MIDSTREAM_HOP_KEY) is not None:
++            return False
++        request_priority: Final = kwargs.get("priority") or self.default_priority
++        if request_priority is not None and isinstance(request_priority, int):
++            return False
++        return not self._is_prompt_management_model(model)
++
++    async def acompletion_attempt(
++        self,
++        model: str,
++        messages: list[AllMessageValues],
++        stream: bool = False,
++        **kwargs,
++    ):
++        """One provider request of an `acompletion` call, fallbacks and retries included."""
+         try:
+             kwargs["model"] = model
+             kwargs["messages"] = messages
+@@ -2915,6 +2967,60 @@
+             "additional_headers": {**item_headers, **fallback_headers},
+         }
+ 
++    def _midstream_hop_stream(
++        self,
++        model_response: CustomStreamWrapper,
++        deployment_slot: contextlib.AsyncExitStack | None = None,
++    ) -> CustomStreamWrapper:
++        """One hop of a continued stream, with the deployment's slot tied to the hop's life.
++
++        The continuation driver decides what a failure means for the caller's stream (see
++        router_utils.midstream_continuation), so this wrapper forwards the provider's chunks
++        and its errors untouched. All it owns is releasing the deployment's
++        max_parallel_requests slot, and the provider connection, once the hop is over.
++        """
++        held_slot: Final = deployment_slot if deployment_slot is not None else contextlib.AsyncExitStack()
++
++        async def hop_stream() -> AsyncGenerator:
++            try:
++                async for item in model_response:
++                    yield item
++            finally:
++                with anyio.CancelScope(shield=True):
++                    if hasattr(model_response, "aclose"):
++                        try:
++                            await model_response.aclose()
++                        except BaseException as close_error:  # noqa: BLE001  # the hop is already over
++                            verbose_router_logger.debug("midstream hop: error closing model_response: %s", close_error)
++                    await held_slot.aclose()
++
++        class MidStreamHopWrapper(FallbackAwareStreamWrapper):
++            def __init__(self, async_generator: AsyncGenerator):
++                super().__init__(
++                    completion_stream=async_generator,
++                    model=model_response.model,
++                    custom_llm_provider=model_response.custom_llm_provider,
++                    logging_obj=model_response.logging_obj,
++                    _response_headers=getattr(model_response, "_response_headers", None),
++                )
++                self._async_generator = async_generator
++                inner_chunks: Final[object] = getattr(model_response, "chunks", None)
++                if isinstance(inner_chunks, list):
++                    self.chunks = inner_chunks
++                if hasattr(model_response, "_hidden_params"):
++                    self._hidden_params = model_response._hidden_params.copy()
++
++            def __aiter__(self):
++                return self
++
++            async def __anext__(self):
++                return await self._async_generator.__anext__()
++
++            async def aclose(self):
++                await self._async_generator.aclose()
++
++        return MidStreamHopWrapper(hop_stream())
++
+     async def _acompletion_streaming_iterator(
+         self,
+         model_response: CustomStreamWrapper,
+@@ -3707,6 +3813,9 @@
+         deployment = None
+         _timeout_debug_deployment_dict = {}  # this is a temporary dict to debug timeout issues
+         try:
++            # One hop of a continued stream: the continuation driver owns the fallback
++            # decision for it, so this attempt hands back the provider's own stream.
++            midstream_hop: Final = kwargs.pop(MIDSTREAM_HOP_KEY, None)
+             input_kwargs_for_streaming_fallback: Final = kwargs.copy()
+             input_kwargs_for_streaming_fallback["model"] = model
+ 
+@@ -3723,6 +3832,9 @@
+                 model=model,
+                 kwargs=kwargs,
+             )
++            if midstream_hop is not None:
++                midstream_hop.deployment = deployment
++                midstream_hop.model_group = model
+ 
+             _timeout_debug_deployment_dict = deployment
+             end_time: Final = time.time()
+@@ -3829,6 +3941,10 @@
+                 )
+ 
+                 if isinstance(response, CustomStreamWrapper):
++                    if midstream_hop is not None:
++                        return self._midstream_hop_stream(
++                            model_response=response, deployment_slot=deployment_slot.pop_all()
++                        )
+                     return await self._acompletion_streaming_iterator(
+                         model_response=response,
+                         messages=messages,
+@@ -5362,6 +5478,7 @@
+         """
+ 
+         passthrough_on_no_deployment: Final = kwargs.pop("passthrough_on_no_deployment", False)
++        midstream_hop: Final = kwargs.pop(MIDSTREAM_HOP_KEY, None)
+         function_name: Final = "_ageneric_api_call_with_fallbacks"
+         deployment = None  # rebind-ok: pre-init so the except block can stamp a failure with no deployment picked
+         try:
+@@ -5379,6 +5496,9 @@
+                     return await original_generic_function(model=model, **kwargs)
+                 raise e
+ 
++            if midstream_hop is not None:
++                midstream_hop.deployment = deployment
++                midstream_hop.model_group = model
+             self._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs, function_name=function_name)
+ 
+             data: Final = deployment["litellm_params"].copy()
+@@ -5791,10 +5911,14 @@
+         hop_kwargs: Final = mid_stream_fallback_hop_kwargs(
+             model=model, original_generic_function=original_generic_function, controls=controls, kwargs=kwargs
+         )
++        driven_by_continuation: Final = kwargs.get(MIDSTREAM_HOP_KEY) is not None
+         response: Final = await self._ageneric_api_call_with_fallbacks_helper(
+             model=model, original_generic_function=original_generic_function, **kwargs
+         )
+         carry_over_pre_routing_selection(live_kwargs=kwargs, snapshot=hop_kwargs)
++        if driven_by_continuation:
++            # the continuation driver reads this hop's events itself
++            return cast("AsyncIterator[bytes]", response)
+         if kwargs.get("stream") and hasattr(response, "__aiter__"):
+             return await self._aanthropic_messages_streaming_iterator(
+                 response=cast("AsyncIterator[bytes]", response),  # cast-ok: stream=True always returns a byte iterator
+@@ -5816,10 +5940,24 @@
+         (#24004) doesn't add another branch there.
+         """
+         if call_type == "anthropic_messages":
++            if kwargs.get("stream") is True and kwargs.get(MIDSTREAM_HOP_KEY) is None:
++                # a /v1/messages stream outlives the provider that started it, as one
++                # message lifecycle (see router_utils.midstream_continuation)
++                return await aanthropic_messages_with_continuation(
++                    router=self, original_function=original_function, kwargs=dict(kwargs)
++                )
+             return await self._aanthropic_messages_with_streaming_fallbacks(
+                 original_function=original_function, **kwargs
+             )
+         return await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
++
++    async def aanthropic_messages_attempt(
++        self,
++        original_function: Callable,
++        **kwargs: object,  # kwargs-ok: forwarded verbatim to the generic call path
++    ) -> Union["AnthropicMessagesResponse", AsyncIterator[bytes]]:
++        """One provider request of an `aanthropic_messages` call, retries included."""
++        return await self._aanthropic_messages_with_streaming_fallbacks(original_function=original_function, **kwargs)
+ 
+     def _generic_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
+         """
+diff -ruN -x __pycache__ -x *.pyc litellm/router_utils/midstream_continuation.py submission/litellm/router_utils/midstream_continuation.py
+--- litellm/router_utils/midstream_continuation.py	1970-01-01 05:30:00
++++ submission/litellm/router_utils/midstream_continuation.py	2026-10-15 17:26:53
+@@ -0,0 +1,1516 @@
++"""Mid-stream continuation: a streamed answer survives its provider failing part-way through.
++
++A provider that dies after the caller has already seen content used to take the partial
++answer with it - the Router could only fail over while nothing had been delivered yet.
++This module drives the request's fallback chain *through* the stream instead: when a
++provider fails, the next group picks the answer up where the caller's copy ends (as an
++assistant prefill, or by regenerating it when the deployment cannot take one, in which
++case the repeat is swallowed on the way out), and its chunks continue the same
++caller-visible stream.
++
++The caller sees one stream - one id, one role, one finish reason, one tool call, one
++Anthropic message lifecycle - and the request is billed for every provider request the
++answer took, each at its own deployment's prices.
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
++from dataclasses import dataclass
++from typing import (
++    TYPE_CHECKING,
++    Any,  # noqa: TID251  # heterogeneous provider payloads: kwargs, deployment dicts, SSE data
++    Final,
++    cast,  # noqa: TID251  # narrowing router kwargs and provider payloads at this boundary
++)
++
++import litellm
++from litellm._logging import verbose_router_logger
++from litellm.litellm_core_utils.core_helpers import safe_deep_copy
++from litellm.types.utils import ChatCompletionDeltaToolCall, Delta, ModelResponseStream, Usage
++
++if TYPE_CHECKING:
++    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObject
++    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
++    from litellm.router import Router
++
++
++# Internal kwarg the Router's per-attempt path pops: present only on a hop this module
++# drives, which is how the attempt knows to hand back its raw stream (this module owns the
++# fallback decision for it) and where it reports the deployment it picked.
++MIDSTREAM_HOP_KEY: Final = "_midstream_continuation_hop"
++
++# model_call_details key holding what earlier provider requests of the same caller-visible
++# stream already billed, so the request's one success log reports the whole request.
++MIDSTREAM_BILLING_KEY: Final = "_midstream_continuation_billing"
++
++
++@dataclass
++class HopHandshake:
++    """One hop's handshake with the Router's attempt path: raw stream out, deployment back.
++
++    ``model_group`` is the group the attempt actually routed to, which is not always the one
++    the hop asked for: the request's first attempt keeps the Router's own pre-stream fallback
++    behaviour, so it may be served by a later group of the same chain.
++    """
++
++    deployment: dict[str, Any] | None = None
++    model_group: str | None = None
++
++
++@dataclass(frozen=True)
++class BillingExtras:
++    """Tokens and cost of the provider requests a stream made before the hop that logs it."""
++
++    prompt_tokens: int
++    completion_tokens: int
++    cost: float
++
++
++@dataclass
++class _Ledger:
++    """Running total of what a continued stream has billed, over billed provider requests."""
++
++    prompt_tokens: int = 0
++    completion_tokens: int = 0
++    cost: float = 0.0
++
++    def add(self, prompt_tokens: int, completion_tokens: int, cost: float) -> None:
++        self.prompt_tokens += prompt_tokens
++        self.completion_tokens += completion_tokens
++        self.cost += cost
++
++    def extras(self) -> BillingExtras:
++        return BillingExtras(
++            prompt_tokens=self.prompt_tokens,
++            completion_tokens=self.completion_tokens,
++            cost=self.cost,
++        )
++
++
++class ContinuationDivergedError(litellm.exceptions.APIError):
++    """A continuation's output contradicts what the caller already received."""
++
++    def __init__(self, message: str, model: str) -> None:
++        super().__init__(status_code=500, message=message, llm_provider="litellm", model=model)
++
++
++# ---------------------------------------------------------------------------
++# billing extras, folded in by the logging object that bills the request
++# ---------------------------------------------------------------------------
++
++
++def _usage_of(result: object) -> Usage | None:
++    usage: Final = getattr(result, "usage", None)
++    if isinstance(usage, Usage):
++        return usage
++    if isinstance(usage, Mapping):
++        try:
++            return Usage(**usage)
++        except Exception:  # noqa: BLE001  # an unparseable usage shape just means "nothing own to add to"
++            return None
++    return None
++
++
++def apply_billing_extras(model_call_details: dict[str, Any], result: object) -> None:
++    """Fold a continued stream's earlier provider requests into the usage and cost being logged.
++
++    Runs on the hop that finished the stream, right before its standard logging payload is
++    built: that hop's own usage and cost are whatever LiteLLM computed for it, and the hops
++    the answer burned before it are added on top. One request, one success event, carrying
++    the request's whole token count and spend.
++    """
++    extras: Final = model_call_details.get(MIDSTREAM_BILLING_KEY)
++    if not isinstance(extras, BillingExtras):
++        return
++    # Consume them: a payload can be rebuilt (a failure log then a success log, a retried
++    # callback), and the extras have to land exactly once on top of the hop's own numbers.
++    model_call_details[MIDSTREAM_BILLING_KEY] = None
++
++    own_usage: Final = (
++        cast("Usage | None", model_call_details.get("combined_usage_object")) or _usage_of(result) or Usage()
++    )
++    model_call_details["combined_usage_object"] = Usage(
++        prompt_tokens=(own_usage.prompt_tokens or 0) + extras.prompt_tokens,
++        completion_tokens=(own_usage.completion_tokens or 0) + extras.completion_tokens,
++        total_tokens=(own_usage.total_tokens or 0) + extras.prompt_tokens + extras.completion_tokens,
++        prompt_tokens_details=own_usage.prompt_tokens_details,
++        completion_tokens_details=own_usage.completion_tokens_details,
++    )
++    own_cost: Final = model_call_details.get("response_cost")
++    model_call_details["response_cost"] = (own_cost if isinstance(own_cost, (int, float)) else 0.0) + extras.cost
++
++
++def _record_billing_extras(logging_obj: LiteLLMLoggingObject | None, extras: BillingExtras) -> None:
++    if logging_obj is None or not hasattr(logging_obj, "model_call_details"):
++        return
++    if extras.prompt_tokens == 0 and extras.completion_tokens == 0 and extras.cost == 0.0:
++        return
++    logging_obj.model_call_details[MIDSTREAM_BILLING_KEY] = extras
++
++
++def _silence_logging(logging_obj: LiteLLMLoggingObject | None) -> None:
++    """Keep an abandoned hop out of the request's callbacks.
++
++    Only the provider request that finishes the answer reports the request, and it reports
++    all of it (see apply_billing_extras), so a hop the stream walked away from must not reach
++    the caller's loggers with its own partial view of the same request.
++    """
++    if logging_obj is None or not hasattr(logging_obj, "model_call_details"):
++        return
++    litellm_params: Final = logging_obj.model_call_details.get("litellm_params")
++    if isinstance(litellm_params, dict):
++        litellm_params["no-log"] = True
++
++
++# ---------------------------------------------------------------------------
++# deployments, prices, token counts
++# ---------------------------------------------------------------------------
++
++
++def _deployment_litellm_params(deployment: Mapping[str, Any] | None) -> Mapping[str, Any]:
++    params: Final = (deployment or {}).get("litellm_params")
++    return params if isinstance(params, Mapping) else {}
++
++
++def _deployment_model(deployment: Mapping[str, Any] | None) -> str:
++    model: Final = _deployment_litellm_params(deployment).get("model")
++    return model if isinstance(model, str) else ""
++
++
++def _deployment_prices(deployment: Mapping[str, Any] | None) -> tuple[float, float]:
++    params: Final = _deployment_litellm_params(deployment)
++    input_cost: Final = params.get("input_cost_per_token")
++    output_cost: Final = params.get("output_cost_per_token")
++    return (
++        float(input_cost) if isinstance(input_cost, (int, float)) else 0.0,
++        float(output_cost) if isinstance(output_cost, (int, float)) else 0.0,
++    )
++
++
++def _group_supports_prefill(router: Router, model_group: str) -> bool:
++    """Whether a group's deployments can continue an assistant message.
++
++    A deployment says it cannot by setting ``model_info.supports_assistant_prefill`` to
++    False; one that says nothing can. A single deployment that cannot is enough to make the
++    whole group answer from the start instead, since a continuation picks a group, not a
++    deployment, and a prefill no deployment in it can honour would come back as an error.
++    """
++    try:
++        deployments: Final = router.get_model_list(model_name=model_group) or []
++    except Exception:  # noqa: BLE001  # an unroutable group is reported by the hop attempt itself
++        return True
++    for deployment in deployments:
++        model_info: Final = deployment.get("model_info") if isinstance(deployment, Mapping) else None
++        if isinstance(model_info, Mapping) and model_info.get("supports_assistant_prefill") is False:
++            return False
++    return True
++
++
++def _count_message_tokens(model: str, messages: Sequence[Any]) -> int:
++    try:
++        return int(litellm.token_counter(model=model, messages=list(messages)))
++    except Exception:  # noqa: BLE001  # token counting must never break a recovered stream
++        verbose_router_logger.debug("midstream continuation: could not count prompt tokens for model=%s", model)
++        return 0
++
++
++def _count_text_tokens(model: str, text: str) -> int:
++    if not text:
++        return 0
++    try:
++        return int(litellm.token_counter(model=model, text=text))
++    except Exception:  # noqa: BLE001  # token counting must never break a recovered stream
++        verbose_router_logger.debug("midstream continuation: could not count text tokens for model=%s", model)
++        return 0
++
++
++def _continuation_messages(
++    original_messages: Sequence[Any],
++    delivered_text: str,
++    *,
++    supports_prefill: bool,
++) -> list[Any]:
++    """The messages a hop receives: the request's own, plus the answer the caller already has.
++
++    A deployment that cannot continue an assistant message gets the request unchanged and
++    answers from the start; the repeat is swallowed on the way back out, never delivered
++    twice. A prefill only ever carries text, so a provider never sees a partial tool call.
++    """
++    messages: Final = [dict(message) if isinstance(message, Mapping) else message for message in original_messages]
++    if not delivered_text or not supports_prefill:
++        return messages
++    return [*messages, {"role": "assistant", "content": delivered_text}]
++
++
++# ---------------------------------------------------------------------------
++# the fallback chain a continued stream walks
++# ---------------------------------------------------------------------------
++
++
++def _fallback_target_group(entry: object) -> str | None:
++    if isinstance(entry, str):
++        return entry
++    if isinstance(entry, Mapping):
++        target: Final = entry.get("model")
++        return target if isinstance(target, str) else None
++    return None
++
++
++# How far consume_through follows a chain of chains looking for the group that answered.
++_CHAIN_WALK_LIMIT: Final = 8
++
++
++class _GroupChain:
++    """The model groups one request's stream may continue on, in fallback-list order."""
++
++    def __init__(self, router: Router, requested_group: str, fallbacks: list[Any] | None) -> None:
++        self._fallbacks = fallbacks if fallbacks is not None else router.fallbacks
++        self._attempted: set[str] = set()
++        self._pending: list[str] = [requested_group]
++        self._last_group = requested_group
++
++    def _groups_for(self, model_group: str) -> list[str]:
++        from litellm.router_utils.fallback_event_handlers import get_fallback_model_group
++
++        if not self._fallbacks:
++            return []
++        try:
++            resolved, _ = get_fallback_model_group(fallbacks=self._fallbacks, model_group=model_group)
++        except Exception:  # noqa: BLE001  # a malformed fallback list just means "no continuation"
++            return []
++        if not resolved:
++            return []
++        targets: Final = (_fallback_target_group(entry) for entry in resolved)
++        return [target for target in targets if target is not None]
++
++    def _refill(self) -> None:
++        if not self._pending:
++            # a group reached through the chain may carry a chain of its own
++            self._pending = [group for group in self._groups_for(self._last_group) if group not in self._attempted]
++
++    def consume_through(self, group: str) -> None:
++        """Treat `group`, and whatever the chain lists before it, as already attempted.
++
++        The Router's own pre-stream fallbacks can serve the first attempt from a group further
++        down the chain; a continuation then has to pick up after that group, not retry the
++        ones that already failed to answer.
++        """
++        for _ in range(_CHAIN_WALK_LIMIT):
++            if group in self._pending:
++                index = self._pending.index(group)
++                self._attempted.update(self._pending[: index + 1])
++                self._pending = self._pending[index + 1 :]
++                self._last_group = group
++                return
++            for candidate in self._pending:
++                self._attempted.add(candidate)
++                self._last_group = candidate
++            self._pending = []
++            self._refill()
++            if not self._pending:
++                break
++        self._attempted.add(group)
++        self._last_group = group
++
++    def has_next(self) -> bool:
++        """Whether another group could still take over, without consuming it."""
++        self._refill()
++        return any(group not in self._attempted for group in self._pending)
++
++    def next_group(self) -> str | None:
++        """The next group to try, or None once the request's fallback list is exhausted."""
++        self._refill()
++        while self._pending:
++            group = self._pending.pop(0)
++            if group in self._attempted:
++                continue
++            self._attempted.add(group)
++            self._last_group = group
++            return group
++        return None
++
++
++# ---------------------------------------------------------------------------
++# failure classification
++# ---------------------------------------------------------------------------
++
++
++def _status_code_of(exception: BaseException) -> int | None:
++    for attribute in ("status_code", "code"):
++        value: Final = getattr(exception, attribute, None)
++        if isinstance(value, bool):
++            continue
++        if isinstance(value, int):
++            return value
++        if isinstance(value, str) and value.isdigit():
++            return int(value)
++    response: Final = getattr(exception, "response", None)
++    status: Final = getattr(response, "status_code", None)
++    return status if isinstance(status, int) else None
++
++
++def is_request_error_status(status_code: int | None) -> bool:
++    """4xx other than 429: the request itself is the problem, so no other provider would do better."""
++    return status_code is not None and 400 <= status_code < 500 and status_code != 429
++
++
++def _is_provider_failure(exception: BaseException | None) -> bool:
++    from litellm.exceptions import MidStreamFallbackError
++
++    if exception is None:
++        return False
++    if isinstance(exception, ContinuationDivergedError):
++        return False
++    if isinstance(exception, MidStreamFallbackError):
++        return True
++    return not is_request_error_status(_status_code_of(exception))
++
++
++def _provider_error(exception: BaseException) -> BaseException:
++    """The provider error behind the Router's internal mid-stream envelope."""
++    from litellm.exceptions import MidStreamFallbackError
++
++    if isinstance(exception, MidStreamFallbackError) and exception.original_exception is not None:
++        return exception.original_exception
++    return exception
++
++
++# ---------------------------------------------------------------------------
++# chat completions
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class _HopOutput:
++    """What one provider request streamed, as the request is billed for it."""
++
++    text: str = ""
++    tool_name: str = ""
++    tool_arguments: str = ""
++    chunks: int = 0
++    completed: bool = False
++
++    @property
++    def billed(self) -> bool:
++        return self.chunks > 0 or self.completed
++
++
++def _delta_carries_output(delta: object) -> bool:
++    if delta is None:
++        return False
++    content: Final = getattr(delta, "content", None)
++    if isinstance(content, str) and content:
++        return True
++    return bool(getattr(delta, "tool_calls", None))
++
++
++def _is_usage_only_chunk(chunk: ModelResponseStream) -> bool:
++    """Whether a chunk exists only to report usage (the chunk ``include_usage`` adds last)."""
++    if _usage_of(chunk) is None:
++        return False
++    choices: Final = chunk.choices or []
++    if not choices:
++        return True
++    choice: Final = choices[0]
++    return choice.finish_reason is None and not _delta_carries_output(choice.delta)
++
++
++class _ChatJoiner:
++    """Turns the chunks of consecutive provider streams into one caller-visible stream."""
++
++    def __init__(self, model_group: str) -> None:
++        self._model_group = model_group
++        self.stream_id: str | None = None
++        self.role_sent = False
++        self.finish_sent = False
++        self.delivered_text = ""
++        self.tool_id: str | None = None
++        self.tool_name: str | None = None
++        self.tool_header_sent = False
++        self.delivered_arguments = ""
++        # per-hop replay cursors: how much of the caller's copy this hop is expected to repeat
++        self._text_replay_target = 0
++        self._text_replay_cursor = 0
++        self._argument_replay_target = 0
++        self._argument_replay_cursor = 0
++        self.hop = _HopOutput()
++
++    def start_hop(self, *, repeats_delivered_text: bool) -> None:
++        self._text_replay_target = len(self.delivered_text) if repeats_delivered_text else 0
++        self._text_replay_cursor = 0
++        # a continuation always restreams a tool call from its first chunk, prefill or not
++        self._argument_replay_target = len(self.delivered_arguments)
++        self._argument_replay_cursor = 0
++        self.hop = _HopOutput()
++
++    @property
++    def _still_replaying(self) -> bool:
++        """Whether this hop stopped before catching up with what the caller already has."""
++        return (
++            self._text_replay_cursor < self._text_replay_target
++            or self._argument_replay_cursor < self._argument_replay_target
++        )
++
++    def diverged(self, detail: str) -> ContinuationDivergedError:
++        return ContinuationDivergedError(
++            message=(
++                f"a continuation of model group {self._model_group} contradicts the answer already "
++                f"streamed to the caller ({detail})"
++            ),
++            model=self._model_group,
++        )
++
++    def _new_text(self, streamed: str) -> str:
++        """`streamed` minus the part of it that repeats text the caller already received."""
++        remaining: Final = self._text_replay_target - self._text_replay_cursor
++        if remaining <= 0:
++            return streamed
++        overlap: Final = streamed[:remaining]
++        already: Final = self.delivered_text[self._text_replay_cursor : self._text_replay_cursor + len(overlap)]
++        if overlap != already:
++            raise self.diverged(f"text {overlap!r} where the caller has {already!r}")
++        self._text_replay_cursor += len(overlap)
++        return streamed[len(overlap) :]
++
++    def _new_arguments(self, streamed: str) -> str:
++        """`streamed` minus the part of a restreamed tool call the caller already received."""
++        remaining: Final = self._argument_replay_target - self._argument_replay_cursor
++        if remaining <= 0:
++            return streamed
++        overlap: Final = streamed[:remaining]
++        already: Final = self.delivered_arguments[
++            self._argument_replay_cursor : self._argument_replay_cursor + len(overlap)
++        ]
++        if overlap != already:
++            raise self.diverged(f"tool arguments {overlap!r} where the caller has {already!r}")
++        self._argument_replay_cursor += len(overlap)
++        return streamed[len(overlap) :]
++
++    def absorb(self, chunk: ModelResponseStream) -> ModelResponseStream | None:
++        """The chunk to hand the caller, or None when the provider only repeated itself."""
++        choices: Final = chunk.choices or []
++        if not choices:
++            return None
++        choice: Final = choices[0]
++        delta: Final = choice.delta
++        carried_output = False  # the provider put text or a tool call in this chunk
++        carries_content = False  # ... and some of it is new to the caller
++        if delta is not None:
++            content: Final = delta.content
++            if isinstance(content, str) and content:
++                carried_output = True
++                self.hop.text += content
++                self.hop.chunks += 1
++                new_text = self._new_text(content)
++                if new_text:
++                    self.delivered_text += new_text
++                    delta.content = new_text
++                    carries_content = True
++                else:
++                    delta.content = None
++            if getattr(delta, "tool_calls", None):
++                carried_output = True
++                carries_content = self._absorb_tool_calls(delta) or carries_content
++
++        if choice.finish_reason is not None:
++            if self.finish_sent:
++                return None
++            if self._still_replaying:
++                raise self.diverged("it answered with less than the caller already has")
++            self.finish_sent = True
++            return self._stamp_identity(chunk)
++        if carried_output and not carries_content:
++            # the provider only restreamed what the caller already has
++            return None
++        return self._stamp_identity(chunk)
++
++    def _absorb_tool_calls(self, delta: Delta) -> bool:
++        """Merge a restreamed tool call into the single one the caller is receiving."""
++        tool_calls: Final = delta.tool_calls
++        if not tool_calls:
++            return False
++        kept: list[ChatCompletionDeltaToolCall] = []
++        for tool_call in tool_calls:
++            function = getattr(tool_call, "function", None)
++            name = getattr(function, "name", None)
++            arguments = getattr(function, "arguments", None)
++            keeps_header = False
++            if name:
++                self.hop.tool_name = name
++                self.hop.chunks += 1
++                if not self.tool_header_sent:
++                    self.tool_header_sent = True
++                    self.tool_id = getattr(tool_call, "id", None)
++                    self.tool_name = name
++                    keeps_header = True
++                elif self.tool_name is not None and name != self.tool_name:
++                    raise self.diverged(f"a tool call named {name!r} where the caller has {self.tool_name!r}")
++                else:
++                    # the caller already has this call's header, so only arguments can be new
++                    tool_call.id = self.tool_id
++                    if function is not None:
++                        function.name = None
++            if isinstance(arguments, str) and arguments:
++                self.hop.tool_arguments += arguments
++                self.hop.chunks += 1
++                new_arguments = self._new_arguments(arguments)
++                if function is not None:
++                    function.arguments = new_arguments
++                if new_arguments:
++                    self.delivered_arguments += new_arguments
++            tool_call.index = 0
++            if keeps_header or getattr(getattr(tool_call, "function", None), "arguments", None):
++                kept.append(tool_call)
++        delta.tool_calls = kept or None
++        return bool(kept)
++
++    def stamp_identity(self, chunk: ModelResponseStream) -> ModelResponseStream:
++        """One id for the whole stream: the one the caller's first chunk carried."""
++        if self.stream_id is None:
++            self.stream_id = chunk.id
++        elif self.stream_id:
++            chunk.id = self.stream_id
++        return chunk
++
++    def _stamp_identity(self, chunk: ModelResponseStream) -> ModelResponseStream:
++        """`delta.role` belongs on the caller's first chunk and nowhere else; so does its id."""
++        self.stamp_identity(chunk)
++        delta: Final = chunk.choices[0].delta if chunk.choices else None
++        if delta is None:
++            return chunk
++        if self.role_sent:
++            delta.role = None
++        else:
++            self.role_sent = True
++            if not delta.role:
++                delta.role = "assistant"
++        return chunk
++
++
++class _ChatSession:
++    """Drives one caller-visible chat stream across however many provider requests it takes."""
++
++    def __init__(
++        self,
++        router: Router,
++        model_group: str,
++        messages: Sequence[Any],
++        kwargs: dict[str, Any],
++    ) -> None:
++        self.router = router
++        self.model_group = model_group
++        self.original_messages = list(messages)
++        self.joiner = _ChatJoiner(model_group)
++        self.ledger = _Ledger()
++        self._fallbacks_disabled = kwargs.get("disable_fallbacks") is True
++        self._base_kwargs = {
++            key: value
++            for key, value in kwargs.items()
++            if key not in ("model", "messages", "stream", "original_function", "disable_fallbacks")
++        }
++        self._chain = _GroupChain(router, model_group, cast("list[Any] | None", kwargs.get("fallbacks")))
++        self._hop_messages: list[Any] = list(messages)
++        self._hop_repeats_delivered_text = False
++        self._opened_any = False
++        self.current_stream: CustomStreamWrapper | None = None
++        self.current_deployment: dict[str, Any] | None = None
++        self.current_logging_obj: LiteLLMLoggingObject | None = None
++        self._pending_usage_chunk: ModelResponseStream | None = None
++
++    # -- hop setup --------------------------------------------------------
++    def _hop_kwargs(self, *, first_attempt: bool) -> dict[str, Any]:
++        hop_kwargs: Final = dict(self._base_kwargs)
++        for bucket in ("metadata", "litellm_metadata"):
++            if isinstance(hop_kwargs.get(bucket), dict):
++                hop_kwargs[bucket] = safe_deep_copy(hop_kwargs[bucket])
++        hop_kwargs.pop("litellm_logging_obj", None)
++        # The request's first attempt keeps the Router's own behaviour for a failure that
++        # happens before a stream exists at all (context-window and content-policy chains,
++        # cooldown-aware routing, order levels). From the moment bytes can flow, this module
++        # owns the fallback decision instead, hop by hop.
++        if first_attempt:
++            if self._fallbacks_disabled:
++                hop_kwargs["disable_fallbacks"] = True
++        else:
++            hop_kwargs["disable_fallbacks"] = True
++        hop_kwargs[MIDSTREAM_HOP_KEY] = HopHandshake()
++        return hop_kwargs
++
++    def _next_hop_plan(self) -> tuple[str, dict[str, Any], HopHandshake] | None:
++        first_attempt: Final = not self._opened_any
++        group: Final = self.model_group if first_attempt else self._chain.next_group()
++        if group is None:
++            return None
++        supports_prefill: Final = _group_supports_prefill(self.router, group)
++        self._hop_messages = _continuation_messages(
++            self.original_messages,
++            self.joiner.delivered_text,
++            supports_prefill=supports_prefill,
++        )
++        self._hop_repeats_delivered_text = not supports_prefill
++        hop_kwargs: Final = self._hop_kwargs(first_attempt=first_attempt)
++        return group, hop_kwargs, cast(HopHandshake, hop_kwargs[MIDSTREAM_HOP_KEY])
++
++    def _adopt_hop(self, stream: CustomStreamWrapper, handshake: HopHandshake, group: str) -> None:
++        first_attempt: Final = not self._opened_any
++        routed_group: Final = handshake.model_group or group
++        if first_attempt or routed_group != group:
++            # the chain never picked this group itself (the Router's own fallbacks did)
++            self._chain.consume_through(routed_group)
++        self._opened_any = True
++        self.current_stream = stream
++        self.current_deployment = handshake.deployment
++        self.current_logging_obj = getattr(stream, "logging_obj", None)
++        _record_billing_extras(self.current_logging_obj, self.ledger.extras())
++        self.joiner.start_hop(repeats_delivered_text=self._hop_repeats_delivered_text)
++
++    def may_continue(self) -> bool:
++        """Whether a provider failure here could still be handed to another group."""
++        return not self._fallbacks_disabled and self._chain.has_next()
++
++    def _hop_failed_to_start(self, handshake: HopHandshake, group: str, error: BaseException) -> None:
++        self.current_deployment = handshake.deployment
++        self.current_stream = None
++        verbose_router_logger.debug("midstream continuation: model group %s could not start a stream: %s", group, error)
++
++    def _bill_failed_hop(self) -> None:
++        """Charge the provider request that just failed for everything it streamed."""
++        hop: Final = self.joiner.hop
++        if not hop.billed:
++            return
++        model: Final = _deployment_model(self.current_deployment)
++        prompt_tokens: Final = _count_message_tokens(model, self._hop_messages)
++        completion_tokens: Final = (
++            _count_text_tokens(model, hop.text)
++            + _count_text_tokens(model, hop.tool_name)
++            + _count_text_tokens(model, hop.tool_arguments)
++        )
++        input_cost, output_cost = _deployment_prices(self.current_deployment)
++        self.ledger.add(
++            prompt_tokens=prompt_tokens,
++            completion_tokens=completion_tokens,
++            cost=prompt_tokens * input_cost + completion_tokens * output_cost,
++        )
++
++    def _request_totals(self, chunk: ModelResponseStream) -> ModelResponseStream:
++        """Report the whole request on the chunk that carries the stream's usage."""
++        self.joiner.stamp_identity(chunk)
++        usage: Final = _usage_of(chunk)
++        if usage is None or not (self.ledger.prompt_tokens or self.ledger.completion_tokens or self.ledger.cost):
++            return chunk
++        own_prompt: Final = usage.prompt_tokens or 0
++        own_completion: Final = usage.completion_tokens or 0
++        reported_cost: Final = getattr(usage, "cost", None)
++        input_cost, output_cost = _deployment_prices(self.current_deployment)
++        own_cost: Final = (
++            float(reported_cost)
++            if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool)
++            else own_prompt * input_cost + own_completion * output_cost
++        )
++        usage.prompt_tokens = own_prompt + self.ledger.prompt_tokens
++        usage.completion_tokens = own_completion + self.ledger.completion_tokens
++        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
++        # `cost` is not a declared field of Usage; this is how LiteLLM's own stream builder
++        # reports a stream's cost (see litellm.main._stamp_streaming_usage_cost)
++        setattr(usage, "cost", own_cost + self.ledger.cost)  # noqa: B010  # extra pydantic field
++        setattr(chunk, "usage", usage)  # noqa: B010  # extra pydantic field
++        return chunk
++
++    def _absorb(self, chunk: object) -> Iterator[ModelResponseStream]:
++        if not isinstance(chunk, ModelResponseStream):
++            if chunk is not None:
++                yield cast(ModelResponseStream, chunk)
++            return
++        if _is_usage_only_chunk(chunk):
++            # held back: only the chunk that ends the stream may carry usage
++            self._pending_usage_chunk = chunk
++            return
++        absorbed: Final = self.joiner.absorb(chunk)
++        if absorbed is None:
++            return
++        if _usage_of(absorbed) is not None:
++            yield self._request_totals(absorbed)
++            return
++        yield absorbed
++
++    def _finish_hop(self) -> Iterator[ModelResponseStream]:
++        self.joiner.hop.completed = True
++        if self._pending_usage_chunk is not None:
++            pending: Final = self._pending_usage_chunk
++            self._pending_usage_chunk = None
++            yield self._request_totals(pending)
++
++    # -- async driving ----------------------------------------------------
++    async def aopen_next_hop(self, previous_error: BaseException | None = None) -> None:
++        """Start the next group's provider request, or raise when none may follow."""
++        last_error = previous_error
++        while True:
++            if last_error is not None and self._fallbacks_disabled:
++                raise _provider_error(last_error)
++            plan = self._next_hop_plan()
++            if plan is None:
++                raise _provider_error(last_error) if last_error is not None else _no_deployment_error(self.model_group)
++            group, hop_kwargs, handshake = plan
++            first_attempt: Final = not self._opened_any
++            try:
++                stream = await self.router.acompletion_attempt(
++                    model=group, messages=self._hop_messages, stream=True, **hop_kwargs
++                )
++            except Exception as hop_error:  # noqa: BLE001  # classified here: continue or surface
++                self._hop_failed_to_start(handshake, group, hop_error)
++                # The first attempt walked the Router's own chain already, so there is no
++                # group left for this module to try.
++                if first_attempt or not _is_provider_failure(hop_error):
++                    raise
++                last_error = hop_error
++                continue
++            self._adopt_hop(stream, handshake, group)
++            return
++
++    async def astream(self) -> AsyncGenerator[ModelResponseStream, None]:
++        try:
++            while self.current_stream is not None:
++                stream = self.current_stream
++                failure: BaseException | None = None
++                try:
++                    async for chunk in stream:
++                        for item in self._absorb(chunk):
++                            yield item
++                except Exception as stream_error:  # noqa: BLE001  # classified below: continue or surface
++                    failure = stream_error
++                else:
++                    for item in self._finish_hop():
++                        yield item
++                    return
++                await _aclose_stream(stream)
++                if not _is_provider_failure(failure) or not self.may_continue():
++                    # nothing follows this provider, so its own failure log stands
++                    raise _provider_error(failure)
++                self._bill_failed_hop()
++                _silence_logging(self.current_logging_obj)
++                await self.aopen_next_hop(previous_error=failure)
++        finally:
++            if self.current_stream is not None:
++                await _aclose_stream(self.current_stream)
++
++    # -- sync driving -----------------------------------------------------
++    def open_next_hop(self, previous_error: BaseException | None = None) -> None:
++        last_error = previous_error
++        while True:
++            if last_error is not None and self._fallbacks_disabled:
++                raise _provider_error(last_error)
++            plan = self._next_hop_plan()
++            if plan is None:
++                raise _provider_error(last_error) if last_error is not None else _no_deployment_error(self.model_group)
++            group, hop_kwargs, handshake = plan
++            first_attempt: Final = not self._opened_any
++            try:
++                stream = self.router.completion_attempt(
++                    model=group, messages=self._hop_messages, stream=True, **hop_kwargs
++                )
++            except Exception as hop_error:  # noqa: BLE001  # classified here: continue or surface
++                self._hop_failed_to_start(handshake, group, hop_error)
++                # as in the async twin: the first attempt already walked the Router's chain
++                if first_attempt or not _is_provider_failure(hop_error):
++                    raise
++                last_error = hop_error
++                continue
++            self._adopt_hop(stream, handshake, group)
++            return
++
++    def stream(self) -> Generator[ModelResponseStream, None, None]:
++        try:
++            while self.current_stream is not None:
++                stream = self.current_stream
++                failure: BaseException | None = None
++                try:
++                    for chunk in stream:
++                        yield from self._absorb(chunk)
++                except Exception as stream_error:  # noqa: BLE001  # classified below: continue or surface
++                    failure = stream_error
++                else:
++                    yield from self._finish_hop()
++                    return
++                _close_stream(stream)
++                if not _is_provider_failure(failure) or not self.may_continue():
++                    # nothing follows this provider, so its own failure log stands
++                    raise _provider_error(failure)
++                self._bill_failed_hop()
++                _silence_logging(self.current_logging_obj)
++                self.open_next_hop(previous_error=failure)
++        finally:
++            if self.current_stream is not None:
++                _close_stream(self.current_stream)
++
++
++def _no_deployment_error(model_group: str) -> BaseException:
++    return litellm.exceptions.APIError(
++        status_code=500,
++        message=f"litellm.Router: no deployment available for model group {model_group}",
++        llm_provider="litellm",
++        model=model_group,
++    )
++
++
++async def _aclose_stream(stream: object) -> None:
++    closer: Final = getattr(stream, "aclose", None)
++    if closer is None:
++        return
++    try:
++        await closer()
++    except BaseException as close_error:  # noqa: BLE001  # best effort: the hop is already over
++        verbose_router_logger.debug("midstream continuation: could not close a stream: %s", close_error)
++
++
++def _close_stream(stream: object) -> None:
++    closer: Final = getattr(stream, "close", None)
++    if closer is None:
++        return
++    try:
++        closer()
++    except BaseException as close_error:  # noqa: BLE001  # best effort: the hop is already over
++        verbose_router_logger.debug("midstream continuation: could not close a stream: %s", close_error)
++
++
++def _hidden_params_of(stream: object) -> dict[str, Any]:
++    hidden_params: Final = getattr(stream, "_hidden_params", None)
++    return dict(hidden_params) if isinstance(hidden_params, dict) else {}
++
++
++def _build_chat_wrapper(session: _ChatSession, iterator: object) -> CustomStreamWrapper:
++    from litellm.router import FallbackAwareStreamWrapper
++
++    source: Final = session.current_stream
++
++    class ContinuationStreamWrapper(FallbackAwareStreamWrapper):
++        """One caller-visible stream, served by however many providers the answer takes."""
++
++        def __init__(self) -> None:
++            super().__init__(
++                completion_stream=iterator,
++                model=getattr(source, "model", None),
++                custom_llm_provider=getattr(source, "custom_llm_provider", None),
++                logging_obj=getattr(source, "logging_obj", None),
++                _response_headers=getattr(source, "_response_headers", None),
++            )
++            self._iterator = iterator
++            self._session = session
++            self._hidden_params = _hidden_params_of(source) or self._hidden_params
++            inner_chunks: Final[object] = getattr(source, "chunks", None)
++            if isinstance(inner_chunks, list):
++                self.chunks = inner_chunks
++
++        def _repoint(self) -> None:
++            """Report the deployment that is currently serving the stream."""
++            current: Final = self._session.current_stream
++            if current is source:
++                return
++            self._hidden_params = _hidden_params_of(current) or self._hidden_params
++            self.logging_obj = getattr(current, "logging_obj", None) or self.logging_obj
++
++        def __iter__(self) -> ContinuationStreamWrapper:
++            return self
++
++        def __aiter__(self) -> ContinuationStreamWrapper:
++            return self
++
++        def __next__(self) -> ModelResponseStream:
++            chunk: Final = next(cast("Iterator[ModelResponseStream]", self._iterator))
++            self._repoint()
++            return chunk
++
++        async def __anext__(self) -> ModelResponseStream:
++            chunk: Final = await cast("AsyncGenerator[ModelResponseStream, None]", self._iterator).__anext__()
++            self._repoint()
++            return chunk
++
++        async def aclose(self) -> None:
++            closer: Final = getattr(self._iterator, "aclose", None)
++            if closer is not None:
++                await closer()
++
++        def close(self) -> None:
++            closer: Final = getattr(self._iterator, "close", None)
++            if closer is not None:
++                closer()
++
++    return ContinuationStreamWrapper()
++
++
++async def acompletion_with_continuation(
++    router: Router,
++    model: str,
++    messages: Sequence[Any],
++    kwargs: dict[str, Any],
++) -> CustomStreamWrapper:
++    """`Router.acompletion(stream=True)`, with a stream that survives a mid-answer failure."""
++    session: Final = _ChatSession(router, model, messages, kwargs)
++    await session.aopen_next_hop()
++    return _build_chat_wrapper(session, session.astream())
++
++
++def completion_with_continuation(
++    router: Router,
++    model: str,
++    messages: Sequence[Any],
++    kwargs: dict[str, Any],
++) -> CustomStreamWrapper:
++    """`Router.completion(stream=True)`, with a stream that survives a mid-answer failure."""
++    session: Final = _ChatSession(router, model, messages, kwargs)
++    session.open_next_hop()
++    return _build_chat_wrapper(session, session.stream())
++
++
++# ---------------------------------------------------------------------------
++# anthropic messages
++# ---------------------------------------------------------------------------
++
++# As in Router._aanthropic_messages_streaming_iterator: a pathological upstream must not be
++# able to grow the pre-content buffer without bound, so the cap commits the stream instead.
++MAX_HELD_PRE_CONTENT_FRAMES: Final = 200
++
++_RECOVERABLE_ANTHROPIC_ERRORS: Final = frozenset({"api_error", "overloaded_error", "rate_limit_error"})
++_ANTHROPIC_ERROR_STATUS: Final = {
++    "invalid_request_error": 400,
++    "authentication_error": 401,
++    "permission_error": 403,
++    "not_found_error": 404,
++    "request_too_large": 413,
++    "rate_limit_error": 429,
++    "api_error": 500,
++    "overloaded_error": 529,
++}
++
++
++@dataclass(frozen=True)
++class _SSEFrame:
++    """One server-sent event: the provider's own bytes plus its decoded payload."""
++
++    raw: bytes
++    data: Mapping[str, Any] | None
++
++    @property
++    def type(self) -> str:
++        return str((self.data or {}).get("type") or "")
++
++
++def _iter_sse_frames(payload: bytes) -> Iterator[_SSEFrame]:
++    for block in payload.split(b"\n\n"):
++        if not block.strip():
++            continue
++        data: Mapping[str, Any] | None = None
++        for line in block.splitlines():
++            if not line.startswith(b"data:"):
++                continue
++            try:
++                decoded = json.loads(line[len(b"data:") :].strip())
++            except (ValueError, TypeError):
++                continue
++            if isinstance(decoded, dict):
++                data = decoded
++                break
++        yield _SSEFrame(raw=block + b"\n\n", data=data)
++
++
++def _sse_frame(event_type: str, payload: Mapping[str, Any]) -> bytes:
++    return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
++
++
++class _AnthropicErrorEvent(Exception):
++    """A provider failure (or request error) the provider reported as an SSE `error` event."""
++
++    def __init__(self, error_type: str, frame: _SSEFrame) -> None:
++        super().__init__(error_type)
++        self.error_type = error_type
++        self.frame = frame
++
++    @property
++    def recoverable(self) -> bool:
++        return self.error_type in _RECOVERABLE_ANTHROPIC_ERRORS
++
++    def as_api_error(self, model_group: str) -> BaseException:
++        return litellm.exceptions.APIError(
++            status_code=_ANTHROPIC_ERROR_STATUS.get(self.error_type, 500),
++            message=f"AnthropicException - {self.error_type}",
++            llm_provider="anthropic",
++            model=model_group,
++        )
++
++
++@dataclass
++class _MessagesHopOutput:
++    text: str = ""
++    tool_name: str = ""
++    tool_input: str = ""
++    chunks: int = 0
++    input_tokens: int = 0
++    output_tokens: int = 0
++    completed: bool = False
++
++    @property
++    def billed(self) -> bool:
++        return self.chunks > 0 or self.completed
++
++
++class _MessagesJoiner:
++    """Keeps consecutive provider streams looking like one Anthropic message lifecycle."""
++
++    def __init__(self, model_group: str) -> None:
++        self._model_group = model_group
++        self.delivered_text = ""
++        self.delivered_input = ""
++        self.message_started = False
++        self.text_block_started = False
++        self.text_block_stopped = False
++        self.tool_block_started = False
++        self.tool_block_stopped = False
++        self.tool_block_index: int | None = None
++        self.tool_id: str | None = None
++        self.tool_name: str | None = None
++        self._text_replay_target = 0
++        self._text_replay_cursor = 0
++        self._input_replay_target = 0
++        self._input_replay_cursor = 0
++        self.hop = _MessagesHopOutput()
++        self._held_message_delta: _SSEFrame | None = None
++        self._pending: list[tuple[str, bytes]] = []
++        self._buffering = False
++
++    def start_hop(self, *, repeats_delivered_text: bool, may_continue: bool) -> None:
++        self._text_replay_target = len(self.delivered_text) if repeats_delivered_text else 0
++        self._text_replay_cursor = 0
++        # a continuation always restreams a tool block from its start, prefill or not
++        self._input_replay_target = len(self.delivered_input)
++        self._input_replay_cursor = 0
++        self.hop = _MessagesHopOutput()
++        self._held_message_delta = None
++        # Until a provider streams actual output, its lifecycle frames are held back while a
++        # fallback could still take over: a message_start forwarded live, then a fallback's own
++        # message_start, would announce two overlapping messages on one SSE stream. Once the
++        # caller has content the stream is committed to whoever produced it, so nothing is held.
++        self._pending = []
++        self._buffering = may_continue and not self.message_started
++
++    def _emit(self, flag: str, raw: bytes) -> list[bytes]:
++        """Hand a lifecycle frame to the caller, or hold it until the lifecycle commits."""
++        if self._buffering and len(self._pending) < MAX_HELD_PRE_CONTENT_FRAMES:
++            self._pending.append((flag, raw))
++            return []
++        self._mark(flag)
++        return [raw]
++
++    def _mark(self, flag: str) -> None:
++        match flag:
++            case "message":
++                self.message_started = True
++            case "text_block":
++                self.text_block_started = True
++            case "text_block_stop":
++                self.text_block_stopped = True
++            case "tool_block_stop":
++                self.tool_block_stopped = True
++            case _:
++                pass
++
++    def _commit(self) -> list[bytes]:
++        """Release the held lifecycle frames: this provider's stream is the caller's now."""
++        released: list[bytes] = []
++        for flag, raw in self._pending:
++            self._mark(flag)
++            released.append(raw)
++        self._pending = []
++        self._buffering = False
++        return released
++
++    def drop_pending(self) -> None:
++        """Forget lifecycle frames the caller never saw, so a continuation can announce its own."""
++        self._pending = []
++        self._buffering = False
++
++    def flush_pending(self) -> list[bytes]:
++        """Release held frames when nothing will follow this provider."""
++        return self._commit()
++
++    @property
++    def _still_replaying(self) -> bool:
++        """Whether this hop stopped before catching up with what the caller already has."""
++        return (
++            self._text_replay_cursor < self._text_replay_target or self._input_replay_cursor < self._input_replay_target
++        )
++
++    def diverged(self, detail: str) -> ContinuationDivergedError:
++        return ContinuationDivergedError(
++            message=(
++                f"a continuation of model group {self._model_group} contradicts the message already "
++                f"streamed to the caller ({detail})"
++            ),
++            model=self._model_group,
++        )
++
++    def _new_text(self, streamed: str) -> str:
++        remaining: Final = self._text_replay_target - self._text_replay_cursor
++        if remaining <= 0:
++            return streamed
++        overlap: Final = streamed[:remaining]
++        already: Final = self.delivered_text[self._text_replay_cursor : self._text_replay_cursor + len(overlap)]
++        if overlap != already:
++            raise self.diverged(f"text {overlap!r} where the caller has {already!r}")
++        self._text_replay_cursor += len(overlap)
++        return streamed[len(overlap) :]
++
++    def _new_input(self, streamed: str) -> str:
++        remaining: Final = self._input_replay_target - self._input_replay_cursor
++        if remaining <= 0:
++            return streamed
++        overlap: Final = streamed[:remaining]
++        already: Final = self.delivered_input[self._input_replay_cursor : self._input_replay_cursor + len(overlap)]
++        if overlap != already:
++            raise self.diverged(f"tool input {overlap!r} where the caller has {already!r}")
++        self._input_replay_cursor += len(overlap)
++        return streamed[len(overlap) :]
++
++    def absorb(self, frame: _SSEFrame) -> list[bytes]:
++        """The bytes to hand the caller for one provider event (often none at all)."""
++        data: Final = frame.data or {}
++        match frame.type:
++            case "message_start":
++                return self._absorb_message_start(frame, data)
++            case "content_block_start":
++                return self._absorb_block_start(frame, data)
++            case "content_block_delta":
++                return self._absorb_block_delta(frame, data)
++            case "content_block_stop":
++                return self._absorb_block_stop(frame, data)
++            case "message_delta":
++                # held back: the caller gets one message_delta, reporting the whole request
++                self._held_message_delta = frame
++                self.hop.output_tokens = _int_field(data.get("usage"), "output_tokens")
++                return []
++            case "message_stop":
++                if self._still_replaying:
++                    raise self.diverged("it answered with less than the caller already has")
++                self.hop.completed = True
++                return []
++            case "error":
++                raise _AnthropicErrorEvent(str((data.get("error") or {}).get("type") or "api_error"), frame)
++            case _:
++                return [frame.raw]
++
++    def _absorb_message_start(self, frame: _SSEFrame, data: Mapping[str, Any]) -> list[bytes]:
++        message: Final = data.get("message")
++        if isinstance(message, Mapping):
++            self.hop.input_tokens = _int_field(message.get("usage"), "input_tokens")
++        if self.message_started:
++            return []
++        return self._emit("message", frame.raw)
++
++    def _absorb_block_start(self, frame: _SSEFrame, data: Mapping[str, Any]) -> list[bytes]:
++        block: Final = data.get("content_block") if isinstance(data.get("content_block"), Mapping) else {}
++        if block.get("type") == "tool_use":
++            # a tool block's own start is output, so it commits the lifecycle
++            released: Final = self._commit()
++            self.hop.chunks += 1
++            self.hop.tool_name = str(block.get("name") or "")
++            if self.tool_block_started:
++                return released
++            self.tool_block_started = True
++            index: Final = data.get("index")
++            self.tool_block_index = index if isinstance(index, int) else 1
++            self.tool_id = cast("str | None", block.get("id"))
++            self.tool_name = cast("str | None", block.get("name"))
++            return [*released, frame.raw]
++        if self.text_block_started:
++            return []
++        return self._emit("text_block", frame.raw)
++
++    def _absorb_block_delta(self, frame: _SSEFrame, data: Mapping[str, Any]) -> list[bytes]:
++        # a delta is output: whatever lifecycle frames were held belong to the caller now
++        released: Final = self._commit()
++        if released:
++            return [*released, *self._absorb_block_delta_payload(frame, data)]
++        return self._absorb_block_delta_payload(frame, data)
++
++    def _absorb_block_delta_payload(self, frame: _SSEFrame, data: Mapping[str, Any]) -> list[bytes]:
++        delta: Final = data.get("delta") if isinstance(data.get("delta"), Mapping) else {}
++        if delta.get("type") == "input_json_delta":
++            piece: Final = str(delta.get("partial_json") or "")
++            self.hop.tool_input += piece
++            self.hop.chunks += 1
++            new_input: Final = self._new_input(piece)
++            if not new_input:
++                return []
++            self.delivered_input += new_input
++            if new_input == piece:
++                return [frame.raw]
++            return [_sse_frame("content_block_delta", {**data, "delta": {**delta, "partial_json": new_input}})]
++        text: Final = delta.get("text")
++        if not isinstance(text, str):
++            return [frame.raw]
++        self.hop.text += text
++        self.hop.chunks += 1
++        new_text: Final = self._new_text(text)
++        if not new_text:
++            return []
++        self.delivered_text += new_text
++        if new_text == text:
++            return [frame.raw]
++        return [_sse_frame("content_block_delta", {**data, "delta": {**delta, "text": new_text}})]
++
++    def _absorb_block_stop(self, frame: _SSEFrame, data: Mapping[str, Any]) -> list[bytes]:
++        if self.tool_block_started and data.get("index") == self.tool_block_index:
++            if self.tool_block_stopped:
++                return []
++            return self._emit("tool_block_stop", frame.raw)
++        if self.text_block_stopped:
++            return []
++        return self._emit("text_block_stop", frame.raw)
++
++    def closing_frames(self, output_tokens: int) -> list[bytes]:
++        """The lifecycle's own ending: one message_delta, carrying the whole request's output."""
++        held: Final = self._held_message_delta
++        data: Final[dict[str, Any]] = dict(held.data or {}) if held is not None else {"type": "message_delta"}
++        usage: Final = dict(data.get("usage")) if isinstance(data.get("usage"), Mapping) else {}
++        usage["output_tokens"] = output_tokens
++        data["usage"] = usage
++        return [
++            *self._commit(),
++            _sse_frame("message_delta", data),
++            _sse_frame("message_stop", {"type": "message_stop"}),
++        ]
++
++
++def _int_field(container: object, field: str) -> int:
++    if not isinstance(container, Mapping):
++        return 0
++    value: Final = container.get(field)
++    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
++
++
++class _MessagesSession:
++    """Drives one caller-visible `/v1/messages` stream across the provider requests it takes."""
++
++    def __init__(self, router: Router, original_function: Callable[..., Any], kwargs: dict[str, Any]) -> None:
++        self.router = router
++        self.original_function = original_function
++        self.model_group = cast(str, kwargs.get("model"))
++        self.original_messages = list(cast("Sequence[Any]", kwargs.get("messages") or []))
++        self.joiner = _MessagesJoiner(self.model_group)
++        self.ledger = _Ledger()
++        self._fallbacks_disabled = kwargs.get("disable_fallbacks") is True
++        self._base_kwargs = {
++            key: value
++            for key, value in kwargs.items()
++            if key
++            not in (
++                "model",
++                "messages",
++                "original_function",
++                "original_generic_function",
++                "attempt_function",
++                "disable_fallbacks",
++            )
++        }
++        self._chain = _GroupChain(router, self.model_group, cast("list[Any] | None", kwargs.get("fallbacks")))
++        self._hop_messages: list[Any] = list(self.original_messages)
++        self._hop_repeats_delivered_text = False
++        self._opened_any = False
++        self.current_stream: Any | None = None
++        self.current_deployment: dict[str, Any] | None = None
++        self.current_logging_obj: LiteLLMLoggingObject | None = None
++
++    def _hop_kwargs(self, *, first_attempt: bool) -> dict[str, Any]:
++        hop_kwargs: Final = dict(self._base_kwargs)
++        for bucket in ("metadata", "litellm_metadata"):
++            if isinstance(hop_kwargs.get(bucket), dict):
++                hop_kwargs[bucket] = safe_deep_copy(hop_kwargs[bucket])
++        hop_kwargs.pop("litellm_logging_obj", None)
++        # as in the chat driver: the first attempt keeps the Router's own pre-stream fallback
++        # behaviour, every continuation after it is this module's decision
++        if first_attempt:
++            if self._fallbacks_disabled:
++                hop_kwargs["disable_fallbacks"] = True
++        else:
++            hop_kwargs["disable_fallbacks"] = True
++        hop_kwargs[MIDSTREAM_HOP_KEY] = HopHandshake()
++        return hop_kwargs
++
++    def may_continue(self) -> bool:
++        """Whether a provider failure here could still be handed to another group."""
++        return not self._fallbacks_disabled and self._chain.has_next()
++
++    async def aopen_next_hop(self, previous_error: BaseException | None = None) -> None:
++        last_error = previous_error
++        while True:
++            if last_error is not None and self._fallbacks_disabled:
++                raise last_error
++            first_attempt: Final = not self._opened_any
++            group = self.model_group if first_attempt else self._chain.next_group()
++            if group is None:
++                raise last_error if last_error is not None else _no_deployment_error(self.model_group)
++            supports_prefill: Final = _group_supports_prefill(self.router, group)
++            self._hop_messages = _continuation_messages(
++                self.original_messages,
++                self.joiner.delivered_text,
++                supports_prefill=supports_prefill,
++            )
++            self._hop_repeats_delivered_text = not supports_prefill
++            hop_kwargs: Final = self._hop_kwargs(first_attempt=first_attempt)
++            handshake: Final = cast(HopHandshake, hop_kwargs[MIDSTREAM_HOP_KEY])
++            try:
++                stream = await self.router.aanthropic_messages_attempt(
++                    original_function=self.original_function,
++                    model=group,
++                    messages=self._hop_messages,
++                    **hop_kwargs,
++                )
++            except Exception as hop_error:  # noqa: BLE001  # classified here: continue or surface
++                self.current_deployment = handshake.deployment
++                self.current_stream = None
++                verbose_router_logger.debug(
++                    "midstream continuation: model group %s could not start a messages stream: %s", group, hop_error
++                )
++                if first_attempt or not _is_provider_failure(hop_error):
++                    raise
++                last_error = hop_error
++                continue
++            routed_group: Final = handshake.model_group or group
++            if first_attempt or routed_group != group:
++                self._chain.consume_through(routed_group)
++            self._opened_any = True
++            self.current_stream = stream
++            self.current_deployment = handshake.deployment
++            self.current_logging_obj = getattr(stream, "litellm_logging_obj", None)
++            _record_billing_extras(self.current_logging_obj, self.ledger.extras())
++            self.joiner.start_hop(
++                repeats_delivered_text=self._hop_repeats_delivered_text, may_continue=self.may_continue()
++            )
++            return
++
++    def _bill_failed_hop(self) -> None:
++        hop: Final = self.joiner.hop
++        if not hop.billed:
++            return
++        model: Final = _deployment_model(self.current_deployment)
++        prompt_tokens: Final = _count_message_tokens(model, self._hop_messages)
++        completion_tokens: Final = (
++            _count_text_tokens(model, hop.text)
++            + _count_text_tokens(model, hop.tool_name)
++            + _count_text_tokens(model, hop.tool_input)
++        )
++        input_cost, output_cost = _deployment_prices(self.current_deployment)
++        self.ledger.add(
++            prompt_tokens=prompt_tokens,
++            completion_tokens=completion_tokens,
++            cost=prompt_tokens * input_cost + completion_tokens * output_cost,
++        )
++
++    async def astream(self) -> AsyncGenerator[bytes, None]:
++        """One message lifecycle, however many providers it takes to finish it."""
++        try:
++            while self.current_stream is not None:
++                stream = self.current_stream
++                failure: BaseException | None = None
++                try:
++                    async for payload in self._aread_hop(stream):
++                        yield payload
++                except _AnthropicErrorEvent as error_event:
++                    failure = error_event
++                except Exception as stream_error:  # noqa: BLE001  # classified below: continue or surface
++                    failure = stream_error
++                else:
++                    for payload in self.joiner.closing_frames(
++                        self.ledger.completion_tokens + self.joiner.hop.output_tokens
++                    ):
++                        yield payload
++                    return
++                await _aclose_stream(stream)
++                recoverable: Final = (
++                    failure.recoverable if isinstance(failure, _AnthropicErrorEvent) else _is_provider_failure(failure)
++                )
++                if recoverable and self.may_continue():
++                    self._bill_failed_hop()
++                    _silence_logging(self.current_logging_obj)
++                    self.joiner.drop_pending()
++                    await self.aopen_next_hop(previous_error=failure)
++                    continue
++                # Nothing follows this provider: the caller is owed whatever it held back,
++                # and then the provider's own verdict.
++                for payload in self.joiner.flush_pending():
++                    yield payload
++                if isinstance(failure, _AnthropicErrorEvent):
++                    yield failure.frame.raw
++                    return
++                raise _provider_error(cast(BaseException, failure))
++        finally:
++            if self.current_stream is not None:
++                await _aclose_stream(self.current_stream)
++
++    async def _aread_hop(self, stream: AsyncIterator[bytes]) -> AsyncGenerator[bytes, None]:
++        """One hop's events, re-framed so a partial event never reaches the caller."""
++        buffer = b""
++        async for chunk in stream:
++            buffer += chunk if isinstance(chunk, bytes) else bytes(chunk) if isinstance(chunk, bytearray) else b""
++            complete, buffer = _split_complete_sse_frames(buffer)
++            if not complete:
++                continue
++            for frame in _iter_sse_frames(complete):
++                for payload in self.joiner.absorb(frame):
++                    yield payload
++
++
++def _split_complete_sse_frames(buffer: bytes) -> tuple[bytes, bytes]:
++    from litellm.proxy.common_utils.sse_keepalive import split_complete_sse_frames
++
++    return split_complete_sse_frames(buffer)
++
++
++class ContinuationAnthropicMessagesStream:
++    """One caller-visible `/v1/messages` byte stream, served by however many providers it takes."""
++
++    def __init__(self, session: _MessagesSession) -> None:
++        self._session = session
++        self._generator = session.astream()
++        self._hidden_params = _hidden_params_of(session.current_stream)
++
++    def __aiter__(self) -> ContinuationAnthropicMessagesStream:
++        return self
++
++    async def __anext__(self) -> bytes:
++        chunk: Final = await self._generator.__anext__()
++        self._hidden_params = _hidden_params_of(self._session.current_stream) or self._hidden_params
++        return chunk
++
++    async def aclose(self) -> None:
++        await self._generator.aclose()
++
++    @property
++    def has_buffered_provider_output(self) -> bool:
++        return getattr(self._session.current_stream, "has_buffered_provider_output", False) is True
++
++
++async def aanthropic_messages_with_continuation(
++    router: Router,
++    original_function: Callable[..., Any],
++    kwargs: dict[str, Any],
++) -> ContinuationAnthropicMessagesStream:
++    """`Router.aanthropic_messages(stream=True)`, with a stream that survives a mid-answer failure."""
++    session: Final = _MessagesSession(router, original_function, kwargs)
++    await session.aopen_next_hop()
++    return ContinuationAnthropicMessagesStream(session)
++
++
++__all__ = (
++    "MIDSTREAM_BILLING_KEY",
++    "MIDSTREAM_HOP_KEY",
++    "BillingExtras",
++    "ContinuationAnthropicMessagesStream",
++    "ContinuationDivergedError",
++    "HopHandshake",
++    "aanthropic_messages_with_continuation",
++    "acompletion_with_continuation",
++    "apply_billing_extras",
++    "completion_with_continuation",
++    "is_request_error_status",
++)

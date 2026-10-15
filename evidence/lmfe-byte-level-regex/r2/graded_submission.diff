@@ -1,0 +1,2422 @@
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/__init__.py submission/lmformatenforcer/__init__.py
+--- lmformatenforcer/__init__.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/__init__.py	2026-10-15 08:22:38
+@@ -8,13 +8,15 @@
+            'TokenEnforcer',
+            'TokenEnforcerTokenizerData',
+            'LMFormatEnforcerException',
+-           'FormatEnforcerAnalyzer',]
++           'FormatEnforcerAnalyzer',
++           'token_bytes_from_tokenizer',]
+ 
+ from .characterlevelparser import CharacterLevelParser, CharacterLevelParserConfig, StringParser, UnionParser, SequenceParser
+ from .regexparser import RegexParser
+ from .jsonschemaparser import JsonSchemaParser
+ from .tokenenforcer import TokenEnforcer, TokenEnforcerTokenizerData
+ from .exceptions import LMFormatEnforcerException
++from .tokenbytes import token_bytes_from_tokenizer
+ try:
+     from .analyzer import FormatEnforcerAnalyzer
+ except ImportError as e:
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/__init__.py submission/lmformatenforcer/bytelevel/__init__.py
+--- lmformatenforcer/bytelevel/__init__.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/__init__.py	2026-10-15 08:22:38
+@@ -0,0 +1,7 @@
++"""Byte level token mask computation for lm-format-enforcer.
++
++This package is only used when the caller supplies ``token_bytes`` to
++:class:`lmformatenforcer.tokenenforcer.TokenEnforcerTokenizerData`. It computes
++token masks directly over the bytes that each token contributes, so that tokens
++holding only part of a UTF-8 character are handled exactly.
++"""
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/automaton.py submission/lmformatenforcer/bytelevel/automaton.py
+--- lmformatenforcer/bytelevel/automaton.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/automaton.py	2026-10-15 08:22:38
+@@ -0,0 +1,138 @@
++"""Walking a vocabulary of byte strings against a character level language."""
++from typing import Dict, Hashable, List, Optional, Tuple
++
++from . import ranges
++from .langs import Lang
++
++DEAD = -1
++_UNKNOWN = -2
++
++
++class ByteAutomaton:
++    """States of ``(language state, bytes of a partial character)`` pairs.
++
++    Transitions are computed on demand and shared between every walk, so the
++    cost of deciding what a byte does is paid once per state and byte.
++    """
++
++    def __init__(self, root: Optional[Lang]):
++        self.langs: List[Lang] = []
++        self.pendings: List[bytes] = []
++        self.allowed: List[ranges.RangeSet] = []
++        self.transitions: List[Dict[int, int]] = []
++        self.complete: List[bool] = []
++        self.index: Dict[Hashable, int] = {}
++        self.root = DEAD if root is None else self.intern(root, b'')
++
++    def intern(self, lang: Lang, pending: bytes) -> int:
++        key = (lang.key(), pending)
++        state = self.index.get(key)
++        if state is None:
++            state = len(self.langs)
++            self.index[key] = state
++            self.langs.append(lang)
++            self.pendings.append(pending)
++            self.allowed.append(lang.allowed())
++            self.transitions.append({})
++            self.complete.append(not pending and lang.can_end())
++        return state
++
++    def can_end(self, state: int) -> bool:
++        return state >= 0 and self.complete[state]
++
++    def compute(self, state: int, byte: int) -> int:
++        lang = self.langs[state]
++        pending = self.pendings[state]
++        allowed = self.allowed[state]
++        if pending:
++            if byte < 0x80 or byte > 0xBF:
++                return DEAD
++            candidate = pending + bytes((byte,))
++            if len(candidate) == ranges.sequence_length(candidate[0]):
++                code_point = ranges.decode_sequence(candidate)
++                if code_point < 0 or not ranges.contains(allowed, code_point):
++                    return DEAD
++                moved = lang.advance(code_point)
++                if moved is None:
++                    return DEAD
++                return self.intern(moved, b'')
++            low, high = ranges.prefix_code_point_bounds(candidate)
++            if low > high or not ranges.contains_range(allowed, low, high):
++                return DEAD
++            return self.intern(lang, candidate)
++        if byte < 0x80:
++            if not ranges.contains(allowed, byte):
++                return DEAD
++            moved = lang.advance(byte)
++            if moved is None:
++                return DEAD
++            return self.intern(moved, b'')
++        if ranges.sequence_length(byte) == 0:
++            return DEAD
++        candidate = bytes((byte,))
++        low, high = ranges.prefix_code_point_bounds(candidate)
++        if low > high or not ranges.contains_range(allowed, low, high):
++            return DEAD
++        return self.intern(lang, candidate)
++
++    def step(self, state: int, byte: int) -> int:
++        if state < 0:
++            return DEAD
++        row = self.transitions[state]
++        target = row.get(byte, _UNKNOWN)
++        if target == _UNKNOWN:
++            target = self.compute(state, byte)
++            row[byte] = target
++        return target
++
++    def walk(self, state: int, data: bytes) -> int:
++        for byte in data:
++            state = self.step(state, byte)
++            if state == DEAD:
++                return DEAD
++        return state
++
++
++class ByteVocabulary:
++    """A trie over the bytes that each token contributes."""
++
++    def __init__(self, token_bytes: Dict[int, bytes]):
++        self.children: List[Dict[int, int]] = [{}]
++        self.tokens: Dict[int, List[int]] = {}
++        self.token_bytes = token_bytes
++        for token_id in sorted(token_bytes):
++            node = 0
++            for byte in token_bytes[token_id]:
++                children = self.children[node]
++                target = children.get(byte)
++                if target is None:
++                    target = len(self.children)
++                    self.children.append({})
++                    children[byte] = target
++                node = target
++            self.tokens.setdefault(node, []).append(token_id)
++
++    def collect(self, automaton: ByteAutomaton, state: int) -> List[int]:
++        """Every token whose bytes keep the output a prefix of an accepted string."""
++        if state < 0:
++            return []
++        result: List[int] = []
++        children = self.children
++        tokens = self.tokens
++        transitions = automaton.transitions
++        compute = automaton.compute
++        stack: List[Tuple[int, int]] = [(0, state)]
++        while stack:
++            node, current = stack.pop()
++            found = tokens.get(node)
++            if found is not None:
++                result.extend(found)
++            row = transitions[current]
++            for byte, child in children[node].items():
++                target = row.get(byte, _UNKNOWN)
++                if target == _UNKNOWN:
++                    target = compute(current, byte)
++                    row[byte] = target
++                if target >= 0:
++                    stack.append((child, target))
++        return result
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/build.py submission/lmformatenforcer/bytelevel/build.py
+--- lmformatenforcer/bytelevel/build.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/build.py	2026-10-15 08:22:38
+@@ -0,0 +1,56 @@
++"""Turn a ``CharacterLevelParser`` into the language it describes."""
++from typing import Optional
++
++from ..characterlevelparser import (CharacterLevelParser, ForceStopParser, SequenceParser,
++                                    StringParser, UnionParser)
++from ..consts import WHITESPACE_CHARACTERS
++from ..jsonschemaparser import JsonSchemaParser
++from ..regexparser import RegexParser
++from . import ranges
++from .jsonlang import json_lang_for
++from .langs import (CountLang, DONE, Lang, LiteralLang, RegexLang, make_sequence, make_union)
++from .regexdfa import compile_pattern
++
++_WHITESPACE_RANGES = ranges.from_chars(WHITESPACE_CHARACTERS)
++
++
++class UnsupportedParser(Exception):
++    """Raised when a parser has no byte level equivalent."""
++
++
++def lang_for_parser(parser: CharacterLevelParser) -> Optional[Lang]:
++    """The language of ``parser``, with every scalar value as its alphabet.
++
++    Returns ``None`` when the parser accepts nothing at all.
++    """
++    if isinstance(parser, RegexParser):
++        pattern = getattr(parser.context, 'pattern_string', None)
++        if pattern is None:
++            raise UnsupportedParser("RegexParser was built without its pattern text")
++        if parser.current_state != parser.context.pattern.initial:
++            raise UnsupportedParser("RegexParser has already consumed characters")
++        return RegexLang.from_pattern(compile_pattern(pattern))
++    if isinstance(parser, JsonSchemaParser):
++        return json_lang_for(parser)
++    if isinstance(parser, StringParser):
++        return LiteralLang(parser.target_str)
++    if isinstance(parser, ForceStopParser):
++        if parser.allow_whitespace:
++            return CountLang(0, 0, None, _WHITESPACE_RANGES)
++        return DONE
++    if isinstance(parser, UnionParser):
++        children = []
++        for child in parser.parsers:
++            built = lang_for_parser(child)
++            if built is not None:
++                children.append(built)
++        return make_union(children)
++    if isinstance(parser, SequenceParser):
++        children = []
++        for child in parser.parsers:
++            built = lang_for_parser(child)
++            if built is None:
++                return None
++            children.append(built)
++        return make_sequence(children)
++    raise UnsupportedParser(f"No byte level support for {type(parser).__name__}")
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/enforcer.py submission/lmformatenforcer/bytelevel/enforcer.py
+--- lmformatenforcer/bytelevel/enforcer.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/enforcer.py	2026-10-15 08:22:38
+@@ -0,0 +1,68 @@
++"""Token masks computed from the bytes that each token contributes."""
++import logging
++from typing import Dict, List, Tuple, Union
++
++from ..tokenlist import TokenList
++from .automaton import ByteAutomaton, ByteVocabulary
++from .build import lang_for_parser
++
++_MISSING = object()
++
++
++class ByteTokenEnforcer:
++    """The byte level counterpart of ``TokenEnforcer``.
++
++    A sequence is tracked by the state of the automaton it reaches, which pairs
++    the state of the constraint with the bytes of a character that is not
++    finished yet. States are shared between sequences, so interleaved calls for
++    several sequences cost no more than one.
++    """
++
++    def __init__(self, vocabulary: ByteVocabulary, token_bytes: Dict[int, bytes],
++                 parser, eos_token_id: Union[int, List[int]], use_bitmask: bool,
++                 vocab_size: int):
++        self.vocabulary = vocabulary
++        self.token_bytes = token_bytes
++        self.automaton = ByteAutomaton(lang_for_parser(parser))
++        self.eos_token_id = eos_token_id
++        self.use_bitmask = use_bitmask
++        self.vocab_size = vocab_size
++        self.prefix_states: Dict[Tuple[int, ...], int] = {}
++        self.mask_cache: Dict[int, TokenList] = {}
++
++    def get_allowed_tokens(self, token_sequence: List[int]) -> TokenList:
++        sequence = tuple(token_sequence)
++        state = self.prefix_states.get(sequence, _MISSING)
++        if state is _MISSING:
++            previous = self.prefix_states.get(sequence[:-1], _MISSING) if sequence else _MISSING
++            if previous is _MISSING:
++                # The first call for this enforcer is the prompt, which is not
++                # part of the constrained output.
++                state = self.automaton.root
++            else:
++                state = self.automaton.walk(previous, self.token_bytes.get(sequence[-1], b''))
++            self.prefix_states[sequence] = state
++        return self.mask_for(state)
++
++    def mask_for(self, state: int) -> TokenList:
++        cached = self.mask_cache.get(state)
++        if cached is not None:
++            return cached
++        allowed = TokenList(self.use_bitmask, self.vocab_size)
++        if state < 0:
++            # The output already left the language, which only happens when a
++            # token outside the mask was chosen. Allow stopping and nothing else.
++            logging.debug("LMFormatEnforcer: the generated bytes left the constraint")
++            self._add_end_of_sequence(allowed)
++        else:
++            allowed.extend(self.vocabulary.collect(self.automaton, state))
++            if self.automaton.can_end(state):
++                self._add_end_of_sequence(allowed)
++        self.mask_cache[state] = allowed
++        return allowed
++
++    def _add_end_of_sequence(self, allowed: TokenList) -> None:
++        if isinstance(self.eos_token_id, list):
++            allowed.extend(self.eos_token_id)
++        else:
++            allowed.append(self.eos_token_id)
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/jsonlang.py submission/lmformatenforcer/bytelevel/jsonlang.py
+--- lmformatenforcer/bytelevel/jsonlang.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/jsonlang.py	2026-10-15 08:22:38
+@@ -0,0 +1,450 @@
++"""A :class:`~lmformatenforcer.bytelevel.langs.Lang` built on ``JsonSchemaParser``.
++
++The structure of the document - objects, arrays, numbers, booleans, whitespace -
++is driven by the unmodified character level parser, so the accepted language is
++exactly the one its interface describes. The contents of JSON strings are taken
++over by the machines in :mod:`lmformatenforcer.bytelevel.jsonstrings`, because a
++string value follows the JSON string grammar with its constraints applied to the
++decoded value.
++"""
++import itertools
++from dataclasses import replace
++from typing import Dict, Hashable, List, Optional, Tuple
++
++from ..characterlevelparser import (CharacterLevelParser, ForceStopParser, SequenceParser,
++                                    StringParser, UnionParser)
++from ..consts import COMPLETE_ALPHABET, WHITESPACE_CHARACTERS
++from ..jsonschemaparser import (JsonSchemaParser, ListParsingState, NumberParsingState,
++                                ObjectParsingState, StringParsingState)
++from . import ranges
++from .jsonstrings import CLOSE, KeyStringMachine, ValueStringMachine
++from .langs import ChoiceLang, CountLang, Lang, RegexLang
++from .ranges import RangeSet
++from .regexdfa import compile_pattern, strip_anchors
++
++#: Stands for "every scalar value that the parser does not name explicitly".
++SENTINEL = chr(0xE000)
++
++_UNSET = object()
++
++#: Keeps the cache keys of one schema apart from those of another, so that two
++#: schema parsers inside the same composite are never taken for one state.
++_environment_numbers = itertools.count()
++
++
++def _is_open_string(parser: CharacterLevelParser) -> bool:
++    return (isinstance(parser, StringParsingState)
++            and parser.require_opening_quote
++            and parser.seen_opening_quote
++            and not parser.seen_closing_quote)
++
++
++def _holds_open_string(parser: CharacterLevelParser) -> bool:
++    """Whether a parser is, or contains, a string whose quote is open.
++
++    Nested ``anyOf`` schemas produce unions of unions, so the search has to go
++    all the way down before the contents of the string are taken over.
++    """
++    if _is_open_string(parser):
++        return True
++    if isinstance(parser, UnionParser):
++        return any(_holds_open_string(option) for option in parser.parsers)
++    return False
++
++
++def _schema_pattern(state: StringParsingState) -> str:
++    """The pattern of a string value, with only redundant anchors removed.
++
++    The character level parser drops a trailing ``$`` even when it is escaped,
++    so the pattern as the schema wrote it is used here instead.
++    """
++    original = getattr(state, 'original_pattern', None)
++    return strip_anchors(original if original is not None else state.pattern)
++
++
++def _inner_language(state: StringParsingState) -> Optional[Lang]:
++    """The language of the decoded contents of a string, from its constraints."""
++    if state.allowed_strings:
++        options = [option for option in state.allowed_strings if isinstance(option, str)]
++        minimum = state.min_length or 0
++        maximum = state.max_length
++        if minimum or maximum is not None:
++            options = [option for option in options if len(option) >= minimum
++                       and (maximum is None or len(option) <= maximum)]
++        if state.pattern:
++            program = compile_pattern(_schema_pattern(state))
++            options = [option for option in options if program.fullmatch(option)]
++        return ChoiceLang.create(options)
++    if state.pattern:
++        return RegexLang.from_pattern(compile_pattern(_schema_pattern(state)))
++    minimum = state.min_length or 0
++    if state.max_length is not None and minimum > state.max_length:
++        return None  # no string can satisfy both bounds
++    return CountLang(0, minimum, state.max_length, ranges.FULL)
++
++
++def _key_language(state: StringParsingState) -> Optional[Lang]:
++    """The language of a property name, with character level semantics."""
++    if state.allowed_strings:
++        return ChoiceLang.create(state.allowed_strings)
++    return CountLang(0, state.min_length or 0, state.max_length, ranges.FULL)
++
++
++class _Atom:
++    __slots__ = ()
++
++    def allowed(self) -> RangeSet:
++        raise NotImplementedError()
++
++    def can_end(self) -> bool:
++        raise NotImplementedError()
++
++    def advance(self, code_point: int) -> List['_Atom']:
++        raise NotImplementedError()
++
++    def key(self) -> Hashable:
++        raise NotImplementedError()
++
++
++class JsonEnvironment:
++    """Shared state for every atom derived from one root ``JsonSchemaParser``."""
++
++    def __init__(self, explicit_alphabet: str):
++        self.number = next(_environment_numbers)
++        self.explicit_chars = set(explicit_alphabet)
++        self.explicit_ranges = ranges.from_chars(self.explicit_chars)
++        self.other_ranges = ranges.subtract(ranges.FULL, self.explicit_ranges)
++        self._identity_tokens: Dict[int, int] = {}
++        self._kept_alive: List[object] = []
++
++    # -- building atoms -------------------------------------------------
++
++    def atoms_for(self, parser: CharacterLevelParser) -> List['_Atom']:
++        atoms: List[_Atom] = []
++        for json_parser in self._flatten(parser):
++            atoms.extend(self._atoms_for_json_parser(json_parser))
++        return atoms
++
++    def _flatten(self, parser: CharacterLevelParser) -> List[JsonSchemaParser]:
++        if isinstance(parser, JsonSchemaParser):
++            return [parser]
++        if isinstance(parser, UnionParser):
++            result: List[JsonSchemaParser] = []
++            for child in parser.parsers:
++                result.extend(self._flatten(child))
++            return result
++        raise TypeError(f"Unexpected parser {type(parser).__name__} in a JSON schema parser")
++
++    def _atoms_for_json_parser(self, parser: JsonSchemaParser) -> List['_Atom']:
++        stack = parser.object_stack
++        if stack:
++            top = stack[-1]
++            if isinstance(top, UnionParser) and _holds_open_string(top):
++                atoms: List[_Atom] = []
++                for option in top.parsers:
++                    atoms.extend(self._atoms_for_json_parser(self._fork(parser, option)))
++                return atoms
++            if _is_open_string(top):
++                machine = self._string_machine(top)
++                if machine is None:
++                    return []
++                return [_StringAtom(self, parser, machine)]
++        return [_StructAtom(self, parser)]
++
++    def _fork(self, parser: JsonSchemaParser, option: CharacterLevelParser) -> JsonSchemaParser:
++        stack = parser.object_stack[:-1] + [option]
++        forked = JsonSchemaParser(parser.context, parser.config, stack,
++                                  parser.num_consecutive_whitespaces)
++        forked.context.active_parser = forked
++        forked.last_parsed_string = parser.last_parsed_string
++        forked.last_non_whitespace_character = parser.last_non_whitespace_character
++        return forked
++
++    def _string_machine(self, state: StringParsingState):
++        if state.is_json_key:
++            inner = _key_language(state)
++            if inner is None:
++                return None
++            return KeyStringMachine(inner, '', track_parsed=bool(state.allowed_strings))
++        inner = _inner_language(state)
++        if inner is None:
++            return None
++        return ValueStringMachine(inner)
++
++    # -- closing a string ------------------------------------------------
++
++    def close_string(self, snapshot: JsonSchemaParser, parsed: str) -> List['_Atom']:
++        # The cache lives on the snapshot so that it cannot outlive it. Object
++        # addresses are reused once an object is freed, so they must never be
++        # cache keys on their own.
++        cache = getattr(snapshot, '_byte_close_cache', None)
++        if cache is None:
++            cache = {}
++            snapshot._byte_close_cache = cache
++        cached = cache.get(parsed)
++        if cached is None:
++            cached = self.atoms_for(self._closed_parser(snapshot, parsed))
++            cache[parsed] = cached
++        return cached
++
++    def _closed_parser(self, snapshot: JsonSchemaParser, parsed: str) -> CharacterLevelParser:
++        top = snapshot.object_stack[-1]
++        assert isinstance(top, StringParsingState)
++        replacement = top._clone()
++        # The contents were handled by the string machine; the character level
++        # parser only needs to see a string that it accepts and then close.
++        replacement.allowed_strings = []
++        replacement.pattern = None
++        replacement.regex_parser = None
++        replacement.min_length = None
++        replacement.max_length = None
++        replacement.parsed_string = parsed
++        stack = snapshot.object_stack[:-1] + [replacement]
++        holder = JsonSchemaParser(snapshot.context, snapshot.config, stack,
++                                  snapshot.num_consecutive_whitespaces)
++        holder.context.active_parser = holder
++        holder.last_parsed_string = snapshot.last_parsed_string
++        holder.last_non_whitespace_character = snapshot.last_non_whitespace_character
++        return holder.add_character('"')
++
++    # -- alphabet --------------------------------------------------------
++
++    def decode_characters(self, characters: str) -> Tuple[RangeSet, frozenset]:
++        char_set = frozenset(characters)
++        named = ranges.from_chars(char_set - {SENTINEL})
++        if SENTINEL in char_set:
++            return ranges.union(named, self.other_ranges), char_set
++        return named, char_set
++
++    def character_for(self, code_point: int) -> str:
++        char = chr(code_point)
++        if char in self.explicit_chars:
++            return char
++        return SENTINEL
++
++    # -- cache keys -------------------------------------------------------
++
++    def identity_token(self, value: object) -> int:
++        """A stable number for ``value``, which is kept alive to own its address."""
++        address = id(value)
++        token = self._identity_tokens.get(address)
++        if token is None:
++            token = len(self._kept_alive)
++            self._kept_alive.append(value)
++            self._identity_tokens[address] = token
++        return token
++
++    def describe(self, parser: JsonSchemaParser) -> Hashable:
++        description = getattr(parser, '_byte_description', _UNSET)
++        if description is _UNSET:
++            description = self.describe_json_parser(parser)
++            if description is None:
++                description = ('identity', self.number, self.identity_token(parser))
++            parser._byte_description = description
++        return description
++
++    def describe_json_parser(self, parser: JsonSchemaParser) -> Optional[Hashable]:
++        parts: List[Hashable] = []
++        for member in parser.object_stack:
++            description = self.describe_member(member)
++            if description is None:
++                return None
++            parts.append(description)
++        return ('json', self.number, tuple(parts), parser.num_consecutive_whitespaces,
++                parser.last_non_whitespace_character, parser.last_parsed_string)
++
++    def describe_member(self, parser: CharacterLevelParser) -> Optional[Hashable]:
++        if isinstance(parser, ObjectParsingState):
++            return ('object', self.identity_token(parser.schema_object),
++                    parser.current_stage.value, parser.is_dictionary,
++                    tuple(sorted(parser.existing_keys)))
++        if isinstance(parser, ListParsingState):
++            return ('list', self.identity_token(parser.list_member_type), parser.min_items,
++                    parser.max_items, parser.num_items_seen, parser.seen_list_opener,
++                    parser.seen_list_closer)
++        if isinstance(parser, NumberParsingState):
++            return ('number', parser.allow_floating_point, parser.parsed_string,
++                    parser.seen_decimal_point, parser.seen_whitespace_after_digits,
++                    parser.seen_exponent, parser.seen_digit)
++        if isinstance(parser, StringParsingState):
++            allowed = tuple(parser.allowed_strings) if parser.allowed_strings else None
++            return ('string', allowed, parser.require_opening_quote, parser.require_closing_quote,
++                    parser.min_length, parser.max_length, parser.pattern, parser.parsed_string,
++                    parser.seen_opening_quote, parser.seen_closing_quote, parser.is_json_key)
++        if isinstance(parser, StringParser):
++            return ('literal', parser.target_str)
++        if isinstance(parser, ForceStopParser):
++            return ('stop', parser.allow_whitespace)
++        if isinstance(parser, UnionParser):
++            descriptions = [self.describe_member(child) for child in parser.parsers]
++            if any(description is None for description in descriptions):
++                return None
++            return ('union', tuple(descriptions))
++        if isinstance(parser, SequenceParser):
++            descriptions = [self.describe_member(child) for child in parser.parsers]
++            if any(description is None for description in descriptions):
++                return None
++            return ('sequence', tuple(descriptions))
++        if isinstance(parser, JsonSchemaParser):
++            return self.describe_json_parser(parser)
++        return None
++
++
++class _StructAtom(_Atom):
++    """A position in the document that the character level parser handles."""
++
++    __slots__ = ('environment', 'parser', '_allowed', '_chars', '_key')
++
++    def __init__(self, environment: JsonEnvironment, parser: JsonSchemaParser):
++        self.environment = environment
++        self.parser = parser
++        self._allowed: Optional[RangeSet] = None
++        self._chars: Optional[frozenset] = None
++        self._key: Optional[Hashable] = None
++
++    def _ensure(self) -> None:
++        if self._allowed is None:
++            self._allowed, self._chars = self.environment.decode_characters(
++                self.parser.get_allowed_characters())
++
++    def allowed(self) -> RangeSet:
++        self._ensure()
++        return self._allowed
++
++    def can_end(self) -> bool:
++        return self.parser.can_end()
++
++    def advance(self, code_point: int) -> List[_Atom]:
++        self._ensure()
++        character = self.environment.character_for(code_point)
++        if character not in self._chars:
++            return []
++        return self.environment.atoms_for(self.parser.add_character(character))
++
++    def key(self) -> Hashable:
++        if self._key is None:
++            self._key = ('struct', self.environment.describe(self.parser))
++        return self._key
++
++
++class _StringAtom(_Atom):
++    """A position inside the contents of a JSON string."""
++
++    __slots__ = ('environment', 'snapshot', 'machine', '_key')
++
++    def __init__(self, environment: JsonEnvironment, snapshot: JsonSchemaParser, machine):
++        self.environment = environment
++        self.snapshot = snapshot
++        self.machine = machine
++        self._key: Optional[Hashable] = None
++
++    def allowed(self) -> RangeSet:
++        return self.machine.allowed()
++
++    def can_end(self) -> bool:
++        return False
++
++    def advance(self, code_point: int) -> List[_Atom]:
++        moved = self.machine.advance(code_point)
++        if moved is None:
++            return []
++        if moved is CLOSE:
++            return self.environment.close_string(self.snapshot, self.machine.resume_value())
++        return [_StringAtom(self.environment, self.snapshot, moved)]
++
++    def key(self) -> Hashable:
++        if self._key is None:
++            self._key = ('instring', self.environment.describe(self.snapshot),
++                         self.machine.key())
++        return self._key
++
++
++class JsonLang(Lang):
++    """A union of positions that the document could currently be in."""
++
++    __slots__ = ('atoms', '_allowed', '_key')
++
++    def __init__(self, atoms: Tuple[_Atom, ...]):
++        self.atoms = atoms
++        self._allowed: Optional[RangeSet] = None
++        self._key: Optional[Hashable] = None
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            self._allowed = ranges.union_all(atom.allowed() for atom in self.atoms)
++        return self._allowed
++
++    def can_end(self) -> bool:
++        return any(atom.can_end() for atom in self.atoms)
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        results: List[_Atom] = []
++        for atom in self.atoms:
++            if ranges.contains(atom.allowed(), code_point):
++                results.extend(atom.advance(code_point))
++        return make_json(results)
++
++    def key(self) -> Hashable:
++        if self._key is None:
++            self._key = ('jsonlang', frozenset(atom.key() for atom in self.atoms))
++        return self._key
++
++
++def make_json(atoms: List[_Atom]) -> Optional[Lang]:
++    unique: Dict[Hashable, _Atom] = {}
++    for atom in atoms:
++        atom_key = atom.key()
++        if atom_key not in unique:
++            unique[atom_key] = atom
++    if not unique:
++        return None
++    return JsonLang(tuple(unique.values()))
++
++
++def _default_alphabet() -> str:
++    return COMPLETE_ALPHABET + WHITESPACE_CHARACTERS + '\\' + SENTINEL
++
++
++def _compile_schema_patterns(value) -> None:
++    """Compile every ``pattern`` in the schema up front.
++
++    An unsupported pattern is then reported while the enforcer is being
++    created, rather than in the middle of a generation.
++    """
++    if isinstance(value, dict):
++        for key, child in value.items():
++            if key == 'pattern' and isinstance(child, str):
++                compile_pattern(strip_anchors(child))
++            else:
++                _compile_schema_patterns(child)
++    elif isinstance(value, list):
++        for child in value:
++            _compile_schema_patterns(child)
++
++
++def json_lang_for(parser: JsonSchemaParser) -> Optional[Lang]:
++    """Create the byte level language of a ``JsonSchemaParser``."""
++    _compile_schema_patterns(getattr(parser.context, 'json_schema', None))
++    alphabet = _default_alphabet()
++    previous_config = parser.config
++    previous_without_quotes = parser.context.alphabet_without_quotes
++    previous_skip = parser.context.skip_regex_parsers
++    parser.config = replace(parser.config, alphabet=alphabet)
++    parser.context.alphabet_without_quotes = alphabet.replace('"', '')
++    parser.context.active_parser = parser
++    # The contents of every string are handled here, so the automata that the
++    # character level parser would build for schema patterns are never used.
++    parser.context.skip_regex_parsers = True
++    try:
++        environment = JsonEnvironment(alphabet.replace(SENTINEL, ''))
++        return make_json(environment.atoms_for(parser))
++    except Exception:
++        # Leave the parser as it was so that the caller can fall back to
++        # matching decoded token strings.
++        parser.config = previous_config
++        parser.context.alphabet_without_quotes = previous_without_quotes
++        parser.context.skip_regex_parsers = previous_skip
++        raise
++
++
++__all__ = ['JsonLang', 'JsonEnvironment', 'json_lang_for', 'SENTINEL']
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/jsonstrings.py submission/lmformatenforcer/bytelevel/jsonstrings.py
+--- lmformatenforcer/bytelevel/jsonstrings.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/jsonstrings.py	2026-10-15 08:22:38
+@@ -0,0 +1,299 @@
++"""State machines for the contents of JSON strings.
++
++Two flavours are needed.
++
++``ValueStringMachine`` implements the JSON string grammar of RFC 8259 for a
++string *value*: raw characters, the short escapes, ``\\uXXXX`` escapes and
++surrogate pairs. The schema constraints of the value (``enum``, ``const``,
++``pattern``, ``minLength``, ``maxLength``) apply to the decoded value, which is
++tracked by an inner :class:`~lmformatenforcer.bytelevel.langs.Lang`.
++
++``KeyStringMachine`` implements what the unmodified character level parser does
++for a property name: characters are taken literally, and a backslash starts an
++escape whose body is consumed by a separate parser and therefore does not become
++part of the parsed name.
++"""
++from typing import Hashable, List, Optional, Tuple
++
++from . import ranges
++from .langs import Lang
++from .ranges import RangeSet
++
++QUOTE = 0x22
++BACKSLASH = 0x5C
++
++#: Characters that may appear unescaped between the quotes of a JSON string.
++RAW_ALLOWED: RangeSet = ranges.subtract(
++    ranges.FULL,
++    ranges.normalize([(0x00, 0x1F), (QUOTE, QUOTE), (BACKSLASH, BACKSLASH)]))
++
++SHORT_ESCAPES = {
++    ord('"'): 0x22,
++    ord('\\'): 0x5C,
++    ord('/'): 0x2F,
++    ord('b'): 0x08,
++    ord('f'): 0x0C,
++    ord('n'): 0x0A,
++    ord('r'): 0x0D,
++    ord('t'): 0x09,
++}
++
++_HEX_VALUES = {}
++for _digit in range(10):
++    _HEX_VALUES[ord('0') + _digit] = _digit
++for _digit in range(6):
++    _HEX_VALUES[ord('a') + _digit] = 10 + _digit
++    _HEX_VALUES[ord('A') + _digit] = 10 + _digit
++
++_HEX_RANGES = ranges.normalize([(ord('0'), ord('9')), (ord('A'), ord('F')), (ord('a'), ord('f'))])
++
++HIGH_SURROGATE_LOW = 0xD800
++HIGH_SURROGATE_HIGH = 0xDBFF
++LOW_SURROGATE_LOW = 0xDC00
++LOW_SURROGATE_HIGH = 0xDFFF
++
++#: Returned by ``advance`` when the character closes the string.
++CLOSE = object()
++
++# Escape modes.
++_NONE = 0
++_AFTER_BACKSLASH = 1
++_IN_HEX = 2
++_PAIR_BACKSLASH = 3
++_PAIR_U = 4
++_PAIR_HEX = 5
++
++
++def _escape_value_code_points(low: int, high: int) -> RangeSet:
++    """Code points encoded by the ``\\uXXXX`` escapes with a value in ``[low, high]``.
++
++    Values in the high surrogate area stand for the first half of a surrogate
++    pair, so they describe the supplementary characters such a pair can encode.
++    Unpaired low surrogates encode nothing.
++    """
++    pairs: List[Tuple[int, int]] = []
++    if low <= min(high, HIGH_SURROGATE_LOW - 1):
++        pairs.append((low, min(high, HIGH_SURROGATE_LOW - 1)))
++    if max(low, LOW_SURROGATE_HIGH + 1) <= high:
++        pairs.append((max(low, LOW_SURROGATE_HIGH + 1), high))
++    first = max(low, HIGH_SURROGATE_LOW)
++    last = min(high, HIGH_SURROGATE_HIGH)
++    if first <= last:
++        pairs.append((0x10000 + ((first - HIGH_SURROGATE_LOW) << 10),
++                      0x10000 + ((last - HIGH_SURROGATE_LOW) << 10) + 0x3FF))
++    return ranges.normalize(pairs)
++
++
++def _prefix_bounds(prefix: int, digits: int) -> Tuple[int, int]:
++    """Bounds of the four digit value that starts with ``digits`` digits ``prefix``."""
++    shift = 4 * (4 - digits)
++    low = prefix << shift
++    return low, low | ((1 << shift) - 1)
++
++
++class ValueStringMachine:
++    """The contents of a JSON string value, with its constraints decoded."""
++
++    __slots__ = ('inner', 'mode', 'prefix', 'digits', 'high', '_allowed')
++
++    def __init__(self, inner: Lang, mode: int = _NONE, prefix: int = 0,
++                 digits: int = 0, high: int = 0):
++        self.inner = inner
++        self.mode = mode
++        self.prefix = prefix
++        self.digits = digits
++        self.high = high
++        self._allowed: Optional[RangeSet] = None
++
++    # -- queries --------------------------------------------------------
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            self._allowed = self._compute_allowed()
++        return self._allowed
++
++    def _compute_allowed(self) -> RangeSet:
++        decodable = self.inner.allowed()
++        if self.mode == _NONE:
++            pairs: List[RangeSet] = [ranges.intersect(decodable, RAW_ALLOWED)]
++            if decodable:
++                pairs.append(ranges.single(BACKSLASH))
++            if self.inner.can_end():
++                pairs.append(ranges.single(QUOTE))
++            return ranges.union_all(pairs)
++        if self.mode == _AFTER_BACKSLASH:
++            code_points = [char for char, decoded in SHORT_ESCAPES.items()
++                           if ranges.contains(decodable, decoded)]
++            if decodable:
++                code_points.append(ord('u'))
++            return ranges.from_code_points(code_points)
++        if self.mode == _IN_HEX:
++            allowed_digits = [char for char, value in _HEX_VALUES.items()
++                              if self._hex_digit_possible(value)]
++            return ranges.from_code_points(allowed_digits)
++        if self.mode == _PAIR_BACKSLASH:
++            return ranges.single(BACKSLASH)
++        if self.mode == _PAIR_U:
++            return ranges.single(ord('u'))
++        allowed_digits = [char for char, value in _HEX_VALUES.items()
++                          if self._pair_digit_possible(value)]
++        return ranges.from_code_points(allowed_digits)
++
++    def _hex_digit_possible(self, value: int) -> bool:
++        prefix = (self.prefix << 4) | value
++        digits = self.digits + 1
++        low, high = _prefix_bounds(prefix, digits)
++        return ranges.intersects(self.inner.allowed(), _escape_value_code_points(low, high))
++
++    def _pair_digit_possible(self, value: int) -> bool:
++        prefix = (self.prefix << 4) | value
++        digits = self.digits + 1
++        low, high = _prefix_bounds(prefix, digits)
++        low = max(low, LOW_SURROGATE_LOW)
++        high = min(high, LOW_SURROGATE_HIGH)
++        if low > high:
++            return False
++        base = 0x10000 + ((self.high - HIGH_SURROGATE_LOW) << 10)
++        return ranges.intersects(self.inner.allowed(),
++                                 ((base + low - LOW_SURROGATE_LOW,
++                                   base + high - LOW_SURROGATE_LOW),))
++
++    def can_close(self) -> bool:
++        return self.mode == _NONE and self.inner.can_end()
++
++    def key(self) -> Hashable:
++        return (self.inner.key(), self.mode, self.prefix, self.digits, self.high)
++
++    # -- transitions ----------------------------------------------------
++
++    def advance(self, code_point: int):
++        mode = self.mode
++        if mode == _NONE:
++            if code_point == QUOTE:
++                return CLOSE if self.inner.can_end() else None
++            if code_point == BACKSLASH:
++                if not self.inner.allowed():
++                    return None
++                return ValueStringMachine(self.inner, _AFTER_BACKSLASH)
++            if not ranges.contains(RAW_ALLOWED, code_point):
++                return None
++            return self._with_decoded(code_point)
++        if mode == _AFTER_BACKSLASH:
++            decoded = SHORT_ESCAPES.get(code_point)
++            if decoded is not None:
++                return self._with_decoded(decoded)
++            if code_point == ord('u') and self.inner.allowed():
++                return ValueStringMachine(self.inner, _IN_HEX, 0, 0)
++            return None
++        if mode == _IN_HEX:
++            value = _HEX_VALUES.get(code_point)
++            if value is None:
++                return None
++            prefix = (self.prefix << 4) | value
++            digits = self.digits + 1
++            if digits < 4:
++                if not self._hex_digit_possible(value):
++                    return None
++                return ValueStringMachine(self.inner, _IN_HEX, prefix, digits)
++            if HIGH_SURROGATE_LOW <= prefix <= HIGH_SURROGATE_HIGH:
++                base = 0x10000 + ((prefix - HIGH_SURROGATE_LOW) << 10)
++                if not ranges.intersects(self.inner.allowed(), ((base, base + 0x3FF),)):
++                    return None
++                return ValueStringMachine(self.inner, _PAIR_BACKSLASH, 0, 0, prefix)
++            if LOW_SURROGATE_LOW <= prefix <= LOW_SURROGATE_HIGH:
++                return None
++            return self._with_decoded(prefix)
++        if mode == _PAIR_BACKSLASH:
++            if code_point != BACKSLASH:
++                return None
++            return ValueStringMachine(self.inner, _PAIR_U, 0, 0, self.high)
++        if mode == _PAIR_U:
++            if code_point != ord('u'):
++                return None
++            return ValueStringMachine(self.inner, _PAIR_HEX, 0, 0, self.high)
++        value = _HEX_VALUES.get(code_point)
++        if value is None or not self._pair_digit_possible(value):
++            return None
++        prefix = (self.prefix << 4) | value
++        digits = self.digits + 1
++        if digits < 4:
++            return ValueStringMachine(self.inner, _PAIR_HEX, prefix, digits, self.high)
++        decoded = 0x10000 + ((self.high - HIGH_SURROGATE_LOW) << 10) + (prefix - LOW_SURROGATE_LOW)
++        return self._with_decoded(decoded)
++
++    def _with_decoded(self, code_point: int) -> Optional['ValueStringMachine']:
++        moved = self.inner.advance(code_point)
++        if moved is None:
++            return None
++        return ValueStringMachine(moved)
++
++    def resume_value(self) -> str:
++        """The text to hand back to the character level parser when the string closes."""
++        return 'x'
++
++
++class KeyStringMachine:
++    """The contents of a JSON property name, with character level semantics."""
++
++    __slots__ = ('inner', 'parsed', 'escape', 'digits', 'track_parsed', '_allowed')
++
++    def __init__(self, inner: Lang, parsed: str, escape: int = _NONE, digits: int = 0,
++                 track_parsed: bool = True):
++        self.inner = inner
++        # Only names that are matched against a list need to be remembered; for a
++        # free name the text is never looked at again, and keeping it would make
++        # every position of the name a separate state.
++        self.parsed = parsed if track_parsed else ''
++        self.escape = escape
++        self.digits = digits
++        self.track_parsed = track_parsed
++        self._allowed: Optional[RangeSet] = None
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            if self.escape == _NONE:
++                allowed = self.inner.allowed()
++                if self.inner.can_end():
++                    allowed = ranges.union(allowed, ranges.single(QUOTE))
++                self._allowed = allowed
++            elif self.escape == _AFTER_BACKSLASH:
++                self._allowed = ranges.from_code_points(
++                    list(SHORT_ESCAPES.keys()) + [ord('u')])
++            else:
++                self._allowed = _HEX_RANGES
++        return self._allowed
++
++    def can_close(self) -> bool:
++        # A quote always ends a property name for the character level parser, so
++        # it closes whenever the name is allowed to contain one here.
++        return self.escape == _NONE and ranges.contains(self.allowed(), QUOTE)
++
++    def key(self) -> Hashable:
++        return (self.inner.key(), self.parsed, self.escape, self.digits)
++
++    def advance(self, code_point: int):
++        if self.escape == _NONE:
++            if code_point == QUOTE:
++                return CLOSE if self.can_close() else None
++            moved = self.inner.advance(code_point)
++            if moved is None:
++                return None
++            parsed = self.parsed + chr(code_point)
++            if code_point == BACKSLASH:
++                return KeyStringMachine(moved, parsed, _AFTER_BACKSLASH, 0, self.track_parsed)
++            return KeyStringMachine(moved, parsed, _NONE, 0, self.track_parsed)
++        if self.escape == _AFTER_BACKSLASH:
++            if code_point in SHORT_ESCAPES:
++                return KeyStringMachine(self.inner, self.parsed, _NONE, 0, self.track_parsed)
++            if code_point == ord('u'):
++                return KeyStringMachine(self.inner, self.parsed, _IN_HEX, 0, self.track_parsed)
++            return None
++        if code_point not in _HEX_VALUES:
++            return None
++        digits = self.digits + 1
++        if digits == 4:
++            return KeyStringMachine(self.inner, self.parsed, _NONE, 0, self.track_parsed)
++        return KeyStringMachine(self.inner, self.parsed, _IN_HEX, digits, self.track_parsed)
++
++    def resume_value(self) -> str:
++        return self.parsed
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/langs.py submission/lmformatenforcer/bytelevel/langs.py
+--- lmformatenforcer/bytelevel/langs.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/langs.py	2026-10-15 08:22:38
+@@ -0,0 +1,286 @@
++"""Character level languages used by the byte level token mask computation.
++
++A :class:`Lang` is an immutable state of a language over Unicode scalar values.
++``allowed()`` returns every scalar value that may come next *and* keeps the
++output completable, so that a token is admissible exactly when every character
++it contributes is allowed along the way.
++"""
++from typing import Dict, Hashable, Iterable, List, Optional, Tuple
++
++from . import ranges
++from .ranges import RangeSet
++from .regexdfa import DEAD_STATE, RegexProgram
++
++
++class Lang:
++    """One state of a language over Unicode scalar values."""
++
++    __slots__ = ()
++
++    def allowed(self) -> RangeSet:
++        raise NotImplementedError()
++
++    def can_end(self) -> bool:
++        raise NotImplementedError()
++
++    def advance(self, code_point: int) -> Optional['Lang']:
++        raise NotImplementedError()
++
++    def key(self) -> Hashable:
++        raise NotImplementedError()
++
++
++class DoneLang(Lang):
++    """A language that accepts only the empty string."""
++
++    __slots__ = ()
++
++    def allowed(self) -> RangeSet:
++        return ranges.EMPTY
++
++    def can_end(self) -> bool:
++        return True
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        return None
++
++    def key(self) -> Hashable:
++        return ('done',)
++
++
++DONE = DoneLang()
++
++
++class RegexLang(Lang):
++    __slots__ = ('program', 'state')
++
++    def __init__(self, program: RegexProgram, state: int):
++        self.program = program
++        self.state = state
++
++    @staticmethod
++    def create(program: RegexProgram, state: int) -> Optional[Lang]:
++        if state == DEAD_STATE:
++            return None
++        return RegexLang(program, state)
++
++    @staticmethod
++    def from_pattern(program: RegexProgram) -> Optional[Lang]:
++        return RegexLang.create(program, program.initial)
++
++    def allowed(self) -> RangeSet:
++        return self.program.allowed[self.state]
++
++    def can_end(self) -> bool:
++        return self.state in self.program.finals
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        return RegexLang.create(self.program, self.program.step(self.state, code_point))
++
++    def key(self) -> Hashable:
++        return ('re', id(self.program), self.state)
++
++
++class LiteralLang(Lang):
++    """Accepts exactly one fixed string."""
++
++    __slots__ = ('remaining',)
++
++    def __init__(self, remaining: str):
++        self.remaining = remaining
++
++    def allowed(self) -> RangeSet:
++        if not self.remaining:
++            return ranges.EMPTY
++        return ranges.single(ord(self.remaining[0]))
++
++    def can_end(self) -> bool:
++        return not self.remaining
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        if self.remaining and ord(self.remaining[0]) == code_point:
++            return LiteralLang(self.remaining[1:])
++        return None
++
++    def key(self) -> Hashable:
++        return ('lit', self.remaining)
++
++
++class ChoiceLang(Lang):
++    """Accepts exactly one of a set of fixed strings (``enum`` and ``const``)."""
++
++    __slots__ = ('options', '_allowed')
++
++    def __init__(self, options: Tuple[str, ...]):
++        self.options = options
++        self._allowed: Optional[RangeSet] = None
++
++    @staticmethod
++    def create(options: Iterable[str]) -> Optional[Lang]:
++        unique = tuple(sorted(set(options)))
++        if not unique:
++            return None
++        return ChoiceLang(unique)
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            self._allowed = ranges.from_code_points(
++                ord(option[0]) for option in self.options if option)
++        return self._allowed
++
++    def can_end(self) -> bool:
++        return '' in self.options
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        char = chr(code_point)
++        return ChoiceLang.create(option[1:] for option in self.options
++                                 if option and option[0] == char)
++
++    def key(self) -> Hashable:
++        return ('choice', self.options)
++
++
++class CountLang(Lang):
++    """Free text of between ``minimum`` and ``maximum`` scalar values."""
++
++    __slots__ = ('length', 'minimum', 'maximum', 'members')
++
++    def __init__(self, length: int, minimum: int, maximum: Optional[int], members: RangeSet):
++        if maximum is None and length > minimum:
++            # Without an upper bound every further character behaves the same,
++            # so states beyond the lower bound are all one state.
++            length = minimum
++        self.length = length
++        self.minimum = minimum
++        self.maximum = maximum
++        self.members = members
++
++    def allowed(self) -> RangeSet:
++        if self.maximum is not None and self.length >= self.maximum:
++            return ranges.EMPTY
++        return self.members
++
++    def can_end(self) -> bool:
++        return self.length >= self.minimum
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        if self.maximum is not None and self.length >= self.maximum:
++            return None
++        if not ranges.contains(self.members, code_point):
++            return None
++        return CountLang(self.length + 1, self.minimum, self.maximum, self.members)
++
++    def key(self) -> Hashable:
++        return ('count', self.length, self.minimum, self.maximum, self.members)
++
++
++class UnionLang(Lang):
++    __slots__ = ('children', '_allowed', '_key')
++
++    def __init__(self, children: Tuple[Lang, ...]):
++        self.children = children
++        self._allowed: Optional[RangeSet] = None
++        self._key: Optional[Hashable] = None
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            self._allowed = ranges.union_all(child.allowed() for child in self.children)
++        return self._allowed
++
++    def can_end(self) -> bool:
++        return any(child.can_end() for child in self.children)
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        results: List[Lang] = []
++        for child in self.children:
++            if ranges.contains(child.allowed(), code_point):
++                moved = child.advance(code_point)
++                if moved is not None:
++                    results.append(moved)
++        return make_union(results)
++
++    def key(self) -> Hashable:
++        if self._key is None:
++            self._key = ('union', frozenset(child.key() for child in self.children))
++        return self._key
++
++
++def make_union(children: Iterable[Lang]) -> Optional[Lang]:
++    flattened: List[Lang] = []
++    for child in children:
++        if isinstance(child, UnionLang):
++            flattened.extend(child.children)
++        else:
++            flattened.append(child)
++    unique: Dict[Hashable, Lang] = {}
++    for child in flattened:
++        child_key = child.key()
++        if child_key not in unique:
++            unique[child_key] = child
++    members = list(unique.values())
++    if not members:
++        return None
++    if len(members) == 1:
++        return members[0]
++    return UnionLang(tuple(members))
++
++
++class SequenceLang(Lang):
++    __slots__ = ('children', '_allowed', '_key')
++
++    def __init__(self, children: Tuple[Lang, ...]):
++        self.children = children
++        self._allowed: Optional[RangeSet] = None
++        self._key: Optional[Hashable] = None
++
++    def allowed(self) -> RangeSet:
++        if self._allowed is None:
++            parts: List[RangeSet] = []
++            for child in self.children:
++                parts.append(child.allowed())
++                if not child.can_end():
++                    break
++            self._allowed = ranges.union_all(parts)
++        return self._allowed
++
++    def can_end(self) -> bool:
++        return all(child.can_end() for child in self.children)
++
++    def advance(self, code_point: int) -> Optional[Lang]:
++        results: List[Lang] = []
++        for index, child in enumerate(self.children):
++            if ranges.contains(child.allowed(), code_point):
++                moved = child.advance(code_point)
++                if moved is not None:
++                    rest = make_sequence((moved,) + self.children[index + 1:])
++                    if rest is not None:
++                        results.append(rest)
++            if not child.can_end():
++                break
++        return make_union(results)
++
++    def key(self) -> Hashable:
++        if self._key is None:
++            self._key = ('seq', tuple(child.key() for child in self.children))
++        return self._key
++
++
++def make_sequence(children: Iterable[Lang]) -> Optional[Lang]:
++    flattened: List[Lang] = []
++    for child in children:
++        if isinstance(child, SequenceLang):
++            flattened.extend(child.children)
++        else:
++            flattened.append(child)
++    kept: List[Lang] = []
++    for child in flattened:
++        if not child.allowed():
++            if not child.can_end():
++                return None  # this part can never be completed
++            continue  # a finished part contributes nothing
++        kept.append(child)
++    if not kept:
++        return DONE
++    if len(kept) == 1:
++        return kept[0]
++    return SequenceLang(tuple(kept))
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/ranges.py submission/lmformatenforcer/bytelevel/ranges.py
+--- lmformatenforcer/bytelevel/ranges.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/ranges.py	2026-10-15 08:22:38
+@@ -0,0 +1,234 @@
++"""Sets of Unicode scalar values, represented as sorted disjoint ranges.
++
++A range set is a tuple of ``(low, high)`` pairs, inclusive on both ends, sorted
++and non overlapping. Surrogate code points (U+D800-U+DFFF) are never members:
++they are not scalar values and cannot be encoded in UTF-8.
++"""
++from bisect import bisect_right
++from typing import Iterable, List, Sequence, Tuple
++
++RangeSet = Tuple[Tuple[int, int], ...]
++
++MAX_CODE_POINT = 0x10FFFF
++SURROGATE_LOW = 0xD800
++SURROGATE_HIGH = 0xDFFF
++
++EMPTY: RangeSet = ()
++FULL: RangeSet = ((0, SURROGATE_LOW - 1), (SURROGATE_HIGH + 1, MAX_CODE_POINT))
++
++
++def normalize(pairs: Iterable[Tuple[int, int]]) -> RangeSet:
++    """Sort, clamp, drop surrogates and merge a sequence of inclusive ranges."""
++    cleaned: List[Tuple[int, int]] = []
++    for low, high in pairs:
++        if low < 0:
++            low = 0
++        if high > MAX_CODE_POINT:
++            high = MAX_CODE_POINT
++        if low > high:
++            continue
++        # Surrogates are not scalar values, split them out.
++        if low < SURROGATE_LOW:
++            cleaned.append((low, min(high, SURROGATE_LOW - 1)))
++        if high > SURROGATE_HIGH:
++            cleaned.append((max(low, SURROGATE_HIGH + 1), high))
++    if not cleaned:
++        return EMPTY
++    cleaned.sort()
++    merged: List[Tuple[int, int]] = []
++    current_low, current_high = cleaned[0]
++    for low, high in cleaned[1:]:
++        if low <= current_high + 1:
++            if high > current_high:
++                current_high = high
++        else:
++            merged.append((current_low, current_high))
++            current_low, current_high = low, high
++    merged.append((current_low, current_high))
++    return tuple(merged)
++
++
++def union(*range_sets: RangeSet) -> RangeSet:
++    pairs: List[Tuple[int, int]] = []
++    for range_set in range_sets:
++        pairs.extend(range_set)
++    return normalize(pairs)
++
++
++def union_all(range_sets: Iterable[RangeSet]) -> RangeSet:
++    pairs: List[Tuple[int, int]] = []
++    for range_set in range_sets:
++        pairs.extend(range_set)
++    return normalize(pairs)
++
++
++def intersect(left: RangeSet, right: RangeSet) -> RangeSet:
++    if not left or not right:
++        return EMPTY
++    result: List[Tuple[int, int]] = []
++    i = j = 0
++    while i < len(left) and j < len(right):
++        low = max(left[i][0], right[j][0])
++        high = min(left[i][1], right[j][1])
++        if low <= high:
++            result.append((low, high))
++        if left[i][1] < right[j][1]:
++            i += 1
++        else:
++            j += 1
++    return tuple(result)
++
++
++def intersects(left: RangeSet, right: RangeSet) -> bool:
++    if not left or not right:
++        return False
++    i = j = 0
++    while i < len(left) and j < len(right):
++        if max(left[i][0], right[j][0]) <= min(left[i][1], right[j][1]):
++            return True
++        if left[i][1] < right[j][1]:
++            i += 1
++        else:
++            j += 1
++    return False
++
++
++def subtract(left: RangeSet, right: RangeSet) -> RangeSet:
++    if not left:
++        return EMPTY
++    if not right:
++        return left
++    right = normalize(right)  # the walk below needs the subtrahend in order
++    result: List[Tuple[int, int]] = []
++    j = 0
++    for low, high in left:
++        current = low
++        while j < len(right) and right[j][1] < current:
++            j += 1
++        k = j
++        while k < len(right) and right[k][0] <= high:
++            if right[k][0] > current:
++                result.append((current, right[k][0] - 1))
++            if right[k][1] + 1 > current:
++                current = right[k][1] + 1
++            if current > high:
++                break
++            k += 1
++        if current <= high:
++            result.append((current, high))
++    return tuple(result)
++
++
++def complement(range_set: RangeSet) -> RangeSet:
++    return subtract(FULL, range_set)
++
++
++def contains(range_set: RangeSet, code_point: int) -> bool:
++    index = bisect_right(range_set, (code_point, MAX_CODE_POINT + 1))
++    if index == 0:
++        return False
++    low, high = range_set[index - 1]
++    return low <= code_point <= high
++
++
++def contains_range(range_set: RangeSet, low: int, high: int) -> bool:
++    """Whether the range set intersects the inclusive interval ``[low, high]``."""
++    if low > high:
++        return False
++    index = bisect_right(range_set, (low, MAX_CODE_POINT + 1))
++    if index > 0 and range_set[index - 1][1] >= low:
++        return True
++    return index < len(range_set) and range_set[index][0] <= high
++
++
++def from_code_points(code_points: Iterable[int]) -> RangeSet:
++    return normalize((code_point, code_point) for code_point in code_points)
++
++
++def from_chars(chars: Iterable[str]) -> RangeSet:
++    return normalize((ord(char), ord(char)) for char in chars)
++
++
++def single(code_point: int) -> RangeSet:
++    return normalize([(code_point, code_point)])
++
++
++def size(range_set: RangeSet) -> int:
++    return sum(high - low + 1 for low, high in range_set)
++
++
++def iterate(range_set: RangeSet) -> Iterable[int]:
++    for low, high in range_set:
++        for code_point in range(low, high + 1):
++            yield code_point
++
++
++# --- UTF-8 helpers -----------------------------------------------------------
++
++#: Number of bytes in the UTF-8 encoding that starts with each lead byte, or 0
++#: if the byte cannot start a sequence.
++_SEQUENCE_LENGTH: List[int] = [0] * 256
++for _byte in range(0x00, 0x80):
++    _SEQUENCE_LENGTH[_byte] = 1
++for _byte in range(0xC2, 0xE0):
++    _SEQUENCE_LENGTH[_byte] = 2
++for _byte in range(0xE0, 0xF0):
++    _SEQUENCE_LENGTH[_byte] = 3
++for _byte in range(0xF0, 0xF5):
++    _SEQUENCE_LENGTH[_byte] = 4
++
++_MIN_FOR_LENGTH = (0, 0, 0x80, 0x800, 0x10000)
++_MAX_FOR_LENGTH = (0, 0x7F, 0x7FF, 0xFFFF, 0x10FFFF)
++
++
++def sequence_length(lead_byte: int) -> int:
++    """Total number of bytes of the UTF-8 sequence starting with ``lead_byte``."""
++    return _SEQUENCE_LENGTH[lead_byte]
++
++
++def prefix_code_point_bounds(prefix: Sequence[int]) -> Tuple[int, int]:
++    """Bounds of the code points whose UTF-8 encoding starts with ``prefix``.
++
++    ``prefix`` must be a non empty sequence of byte values that is shorter than
++    the full sequence. Returns ``(low, high)``; ``low > high`` means that no
++    scalar value has this prefix.
++    """
++    lead = prefix[0]
++    length = _SEQUENCE_LENGTH[lead]
++    if length == 0 or len(prefix) >= length:
++        return 1, 0
++    if length == 1:
++        return lead, lead
++    value = lead & (0x7F >> length)
++    for byte in prefix[1:]:
++        if byte < 0x80 or byte > 0xBF:
++            return 1, 0
++        value = (value << 6) | (byte & 0x3F)
++    remaining = length - len(prefix)
++    low = value << (6 * remaining)
++    high = low | ((1 << (6 * remaining)) - 1)
++    if low < _MIN_FOR_LENGTH[length]:
++        low = _MIN_FOR_LENGTH[length]
++    if high > _MAX_FOR_LENGTH[length]:
++        high = _MAX_FOR_LENGTH[length]
++    return low, high
++
++
++def decode_sequence(sequence: Sequence[int]) -> int:
++    """Decode a complete UTF-8 sequence, or return -1 if it is not valid."""
++    lead = sequence[0]
++    length = _SEQUENCE_LENGTH[lead]
++    if length == 0 or length != len(sequence):
++        return -1
++    if length == 1:
++        return lead
++    value = lead & (0x7F >> length)
++    for byte in sequence[1:]:
++        if byte < 0x80 or byte > 0xBF:
++            return -1
++        value = (value << 6) | (byte & 0x3F)
++    if value < _MIN_FOR_LENGTH[length] or value > _MAX_FOR_LENGTH[length]:
++        return -1
++    if SURROGATE_LOW <= value <= SURROGATE_HIGH:
++        return -1
++    return value
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel/regexdfa.py submission/lmformatenforcer/bytelevel/regexdfa.py
+--- lmformatenforcer/bytelevel/regexdfa.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel/regexdfa.py	2026-10-15 08:22:38
+@@ -0,0 +1,516 @@
++"""A small regular expression engine over Unicode scalar values.
++
++It supports the subset of the syntax that lm-format-enforcer constraints use:
++literal characters, ``.``, bracket classes with ranges and leading ``^``
++negation, groups, alternation and the greedy quantifiers ``?``, ``*``, ``+``,
++``{m}``, ``{m,}`` and ``{m,n}``. Patterns are compiled to a deterministic
++automaton whose transitions are keyed by ranges of scalar values, so that a
++class such as ``[^,]`` describes every scalar value it admits rather than only
++the ones that happen to exist as whole tokens.
++"""
++from bisect import bisect_right
++from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
++
++from . import ranges
++from .ranges import RangeSet
++
++_NEWLINE = ord('\n')
++
++DOT = ranges.subtract(ranges.FULL, ranges.single(_NEWLINE))
++
++_DIGIT = ranges.normalize([(ord('0'), ord('9'))])
++_WORD = ranges.normalize([(ord('0'), ord('9')), (ord('A'), ord('Z')),
++                          (ord('a'), ord('z')), (ord('_'), ord('_'))])
++_SPACE = ranges.from_chars(' \t\n\r\f\v')
++
++_CLASS_ESCAPES: Dict[str, RangeSet] = {
++    'd': _DIGIT,
++    'D': ranges.subtract(ranges.FULL, _DIGIT),
++    'w': _WORD,
++    'W': ranges.subtract(ranges.FULL, _WORD),
++    's': _SPACE,
++    'S': ranges.subtract(ranges.FULL, _SPACE),
++}
++
++_CHAR_ESCAPES: Dict[str, int] = {
++    'n': 0x0A, 't': 0x09, 'r': 0x0D, 'f': 0x0C, 'v': 0x0B, 'a': 0x07,
++    'b': 0x08, '0': 0x00, 'e': 0x1B,
++}
++
++
++class RegexSyntaxError(ValueError):
++    pass
++
++
++# --- Syntax tree -------------------------------------------------------------
++
++class _Node:
++    __slots__ = ()
++
++
++class _Set(_Node):
++    __slots__ = ('range_set',)
++
++    def __init__(self, range_set: RangeSet):
++        self.range_set = range_set
++
++
++class _Concat(_Node):
++    __slots__ = ('parts',)
++
++    def __init__(self, parts: List[_Node]):
++        self.parts = parts
++
++
++class _Alt(_Node):
++    __slots__ = ('options',)
++
++    def __init__(self, options: List[_Node]):
++        self.options = options
++
++
++class _Repeat(_Node):
++    __slots__ = ('child', 'minimum', 'maximum')
++
++    def __init__(self, child: _Node, minimum: int, maximum: Optional[int]):
++        self.child = child
++        self.minimum = minimum
++        self.maximum = maximum
++
++
++# --- Parser ------------------------------------------------------------------
++
++class _Parser:
++    def __init__(self, pattern: str):
++        self.pattern = pattern
++        self.position = 0
++
++    def at_end(self) -> bool:
++        return self.position >= len(self.pattern)
++
++    def peek(self) -> str:
++        return self.pattern[self.position]
++
++    def parse(self) -> _Node:
++        node = self.parse_alternation()
++        if not self.at_end():
++            raise RegexSyntaxError(f"Unexpected '{self.peek()}' at {self.position} in {self.pattern!r}")
++        return node
++
++    def parse_alternation(self) -> _Node:
++        options = [self.parse_concat()]
++        while not self.at_end() and self.peek() == '|':
++            self.position += 1
++            options.append(self.parse_concat())
++        if len(options) == 1:
++            return options[0]
++        return _Alt(options)
++
++    def parse_concat(self) -> _Node:
++        parts: List[_Node] = []
++        while not self.at_end() and self.peek() not in '|)':
++            parts.append(self.parse_quantified())
++        if len(parts) == 1:
++            return parts[0]
++        return _Concat(parts)
++
++    def parse_quantified(self) -> _Node:
++        atom = self.parse_atom()
++        while not self.at_end():
++            char = self.peek()
++            if char == '?':
++                self.position += 1
++                atom = _Repeat(atom, 0, 1)
++            elif char == '*':
++                self.position += 1
++                atom = _Repeat(atom, 0, None)
++            elif char == '+':
++                self.position += 1
++                atom = _Repeat(atom, 1, None)
++            elif char == '{':
++                bounds = self.try_parse_bounds()
++                if bounds is None:
++                    break
++                atom = _Repeat(atom, bounds[0], bounds[1])
++            else:
++                break
++            # A lazy or possessive marker is not part of the supported subset,
++            # but tolerate it so that patterns stay parseable.
++            if not self.at_end() and self.peek() in '?+':
++                if self.peek() == '?':
++                    self.position += 1
++                break
++        return atom
++
++    def try_parse_bounds(self) -> Optional[Tuple[int, Optional[int]]]:
++        start = self.position
++        self.position += 1  # consume '{'
++        digits = ''
++        while not self.at_end() and self.peek().isdigit():
++            digits += self.peek()
++            self.position += 1
++        if not digits:
++            self.position = start
++            return None
++        minimum = int(digits)
++        if not self.at_end() and self.peek() == '}':
++            self.position += 1
++            return minimum, minimum
++        if self.at_end() or self.peek() != ',':
++            self.position = start
++            return None
++        self.position += 1
++        digits = ''
++        while not self.at_end() and self.peek().isdigit():
++            digits += self.peek()
++            self.position += 1
++        if self.at_end() or self.peek() != '}':
++            self.position = start
++            return None
++        self.position += 1
++        if not digits:
++            return minimum, None
++        maximum = int(digits)
++        if maximum < minimum:
++            raise RegexSyntaxError(f"Invalid repetition bounds in {self.pattern!r}")
++        return minimum, maximum
++
++    def parse_atom(self) -> _Node:
++        char = self.peek()
++        if char == '(':
++            self.position += 1
++            if self.pattern.startswith('?:', self.position):
++                self.position += 2
++            elif self.pattern.startswith('?', self.position):
++                raise RegexSyntaxError(f"Unsupported group extension in {self.pattern!r}")
++            node = self.parse_alternation()
++            if self.at_end() or self.peek() != ')':
++                raise RegexSyntaxError(f"Unbalanced '(' in {self.pattern!r}")
++            self.position += 1
++            return node
++        if char == '[':
++            return _Set(self.parse_class())
++        if char == '.':
++            self.position += 1
++            return _Set(DOT)
++        if char == '\\':
++            return self.parse_escape()
++        if char in '*+?':
++            raise RegexSyntaxError(f"Nothing to repeat at {self.position} in {self.pattern!r}")
++        self.position += 1
++        return _Set(ranges.single(ord(char)))
++
++    def parse_escape(self) -> _Node:
++        self.position += 1
++        if self.at_end():
++            raise RegexSyntaxError(f"Trailing backslash in {self.pattern!r}")
++        char = self.peek()
++        if char in _CLASS_ESCAPES:
++            self.position += 1
++            return _Set(_CLASS_ESCAPES[char])
++        return _Set(ranges.single(self.parse_escaped_code_point()))
++
++    def parse_escaped_code_point(self) -> int:
++        """Read the escaped character after a backslash that was consumed."""
++        char = self.peek()
++        self.position += 1
++        if char == 'x':
++            return self.read_hex(2)
++        if char == 'u':
++            return self.read_hex(4)
++        if char == 'U':
++            return self.read_hex(8)
++        if char.isalnum():
++            if char in _CHAR_ESCAPES:
++                return _CHAR_ESCAPES[char]
++            raise RegexSyntaxError(f"Unsupported escape '\\{char}' in {self.pattern!r}")
++        return ord(char)
++
++    def read_hex(self, count: int) -> int:
++        digits = self.pattern[self.position:self.position + count]
++        if len(digits) != count or any(digit not in '0123456789abcdefABCDEF' for digit in digits):
++            raise RegexSyntaxError(f"Bad hexadecimal escape in {self.pattern!r}")
++        self.position += count
++        return int(digits, 16)
++
++    def parse_class(self) -> RangeSet:
++        self.position += 1  # consume '['
++        negated = False
++        if not self.at_end() and self.peek() == '^':
++            negated = True
++            self.position += 1
++        pairs: List[Tuple[int, int]] = []
++        extra: List[RangeSet] = []
++        first = True
++        while True:
++            if self.at_end():
++                raise RegexSyntaxError(f"Unterminated character class in {self.pattern!r}")
++            char = self.peek()
++            if char == ']' and not first:
++                self.position += 1
++                break
++            first = False
++            if char == '\\':
++                self.position += 1
++                if self.at_end():
++                    raise RegexSyntaxError(f"Trailing backslash in {self.pattern!r}")
++                escaped = self.peek()
++                if escaped in _CLASS_ESCAPES:
++                    self.position += 1
++                    extra.append(_CLASS_ESCAPES[escaped])
++                    continue
++                low = self.parse_escaped_code_point()
++            else:
++                self.position += 1
++                low = ord(char)
++            if (not self.at_end() and self.peek() == '-'
++                    and self.position + 1 < len(self.pattern)
++                    and self.pattern[self.position + 1] != ']'):
++                self.position += 1
++                char = self.peek()
++                if char == '\\':
++                    self.position += 1
++                    if self.at_end():
++                        raise RegexSyntaxError(f"Trailing backslash in {self.pattern!r}")
++                    if self.peek() in _CLASS_ESCAPES:
++                        raise RegexSyntaxError(f"Bad character range in {self.pattern!r}")
++                    high = self.parse_escaped_code_point()
++                else:
++                    self.position += 1
++                    high = ord(char)
++                if high < low:
++                    raise RegexSyntaxError(f"Bad character range in {self.pattern!r}")
++                pairs.append((low, high))
++            else:
++                pairs.append((low, low))
++        members = ranges.union(ranges.normalize(pairs), ranges.union_all(extra))
++        if negated:
++            return ranges.subtract(ranges.FULL, members)
++        return members
++
++
++def strip_anchors(pattern: str) -> str:
++    """Remove a leading ``^`` and a trailing unescaped ``$``.
++
++    Constraints are always matched against the whole output, so the anchors
++    that schema patterns are sometimes written with are redundant.
++    """
++    if pattern.startswith('^'):
++        pattern = pattern[1:]
++    if pattern.endswith('$'):
++        backslashes = 0
++        index = len(pattern) - 2
++        while index >= 0 and pattern[index] == '\\':
++            backslashes += 1
++            index -= 1
++        if backslashes % 2 == 0:
++            pattern = pattern[:-1]
++    return pattern
++
++
++# --- Compilation -------------------------------------------------------------
++
++class _Fragment:
++    __slots__ = ('start', 'end')
++
++    def __init__(self, start: int, end: int):
++        self.start = start
++        self.end = end
++
++
++class _NFA:
++    def __init__(self) -> None:
++        self.epsilon: List[List[int]] = []
++        self.moves: List[List[Tuple[RangeSet, int]]] = []
++
++    def new_state(self) -> int:
++        self.epsilon.append([])
++        self.moves.append([])
++        return len(self.epsilon) - 1
++
++    def build(self, node: _Node) -> _Fragment:
++        if isinstance(node, _Set):
++            start = self.new_state()
++            end = self.new_state()
++            if node.range_set:
++                self.moves[start].append((node.range_set, end))
++            return _Fragment(start, end)
++        if isinstance(node, _Concat):
++            if not node.parts:
++                state = self.new_state()
++                return _Fragment(state, state)
++            fragments = [self.build(part) for part in node.parts]
++            for left, right in zip(fragments, fragments[1:]):
++                self.epsilon[left.end].append(right.start)
++            return _Fragment(fragments[0].start, fragments[-1].end)
++        if isinstance(node, _Alt):
++            start = self.new_state()
++            end = self.new_state()
++            for option in node.options:
++                fragment = self.build(option)
++                self.epsilon[start].append(fragment.start)
++                self.epsilon[fragment.end].append(end)
++            return _Fragment(start, end)
++        if isinstance(node, _Repeat):
++            return self.build_repeat(node)
++        raise RegexSyntaxError(f"Unsupported node {node!r}")
++
++    def build_repeat(self, node: _Repeat) -> _Fragment:
++        start = self.new_state()
++        current = start
++        for _ in range(node.minimum):
++            fragment = self.build(node.child)
++            self.epsilon[current].append(fragment.start)
++            current = fragment.end
++        end = self.new_state()
++        if node.maximum is None:
++            loop = self.build(node.child)
++            self.epsilon[current].append(loop.start)
++            self.epsilon[loop.end].append(loop.start)
++            self.epsilon[loop.end].append(end)
++            self.epsilon[current].append(end)
++        else:
++            optional = node.maximum - node.minimum
++            for _ in range(optional):
++                fragment = self.build(node.child)
++                self.epsilon[current].append(fragment.start)
++                self.epsilon[current].append(end)
++                current = fragment.end
++            self.epsilon[current].append(end)
++        return _Fragment(start, end)
++
++    def closure(self, states: Sequence[int]) -> FrozenSet[int]:
++        stack = list(states)
++        seen: Set[int] = set(states)
++        while stack:
++            state = stack.pop()
++            for target in self.epsilon[state]:
++                if target not in seen:
++                    seen.add(target)
++                    stack.append(target)
++        return frozenset(seen)
++
++
++DEAD_STATE = -1
++
++
++class RegexProgram:
++    """A deterministic automaton for one pattern, over scalar value ranges."""
++
++    def __init__(self, pattern: str):
++        self.pattern = pattern
++        node = _Parser(strip_anchors(pattern)).parse()
++        nfa = _NFA()
++        fragment = nfa.build(node)
++        boundaries: Set[int] = {0, ranges.MAX_CODE_POINT + 1}
++        for moves in nfa.moves:
++            for range_set, _ in moves:
++                for low, high in range_set:
++                    boundaries.add(low)
++                    boundaries.add(high + 1)
++        points = sorted(boundaries)
++        self.interval_starts: List[int] = points[:-1]
++        intervals: List[Tuple[int, int]] = [
++            (points[index], points[index + 1] - 1) for index in range(len(points) - 1)
++        ]
++        self.intervals = intervals
++        move_intervals: List[List[Tuple[int, int]]] = []
++        for moves in nfa.moves:
++            entries: List[Tuple[int, int]] = []
++            for range_set, target in moves:
++                for low, high in range_set:
++                    first = bisect_right(self.interval_starts, low) - 1
++                    index = first
++                    while index < len(intervals) and intervals[index][0] <= high:
++                        entries.append((index, target))
++                        index += 1
++            move_intervals.append(entries)
++
++        initial_set = nfa.closure([fragment.start])
++        self.transitions: List[Dict[int, int]] = []
++        self.finals: Set[int] = set()
++        state_ids: Dict[FrozenSet[int], int] = {initial_set: 0}
++        state_sets: List[FrozenSet[int]] = [initial_set]
++        self.transitions.append({})
++        queue = [0]
++        while queue:
++            state_id = queue.pop()
++            members = state_sets[state_id]
++            if fragment.end in members:
++                self.finals.add(state_id)
++            grouped: Dict[int, Set[int]] = {}
++            for member in members:
++                for interval_index, target in move_intervals[member]:
++                    grouped.setdefault(interval_index, set()).add(target)
++            row: Dict[int, int] = {}
++            for interval_index, targets in grouped.items():
++                target_set = nfa.closure(sorted(targets))
++                target_id = state_ids.get(target_set)
++                if target_id is None:
++                    target_id = len(state_sets)
++                    state_ids[target_set] = target_id
++                    state_sets.append(target_set)
++                    self.transitions.append({})
++                    queue.append(target_id)
++                row[interval_index] = target_id
++            self.transitions[state_id] = row
++
++        self._prune_dead_states()
++        self.initial: int = 0 if 0 in self.live else DEAD_STATE
++        self.allowed: List[RangeSet] = []
++        for state_id, row in enumerate(self.transitions):
++            pairs: List[Tuple[int, int]] = []
++            for interval_index, target in row.items():
++                if target in self.live:
++                    pairs.append(intervals[interval_index])
++            self.allowed.append(ranges.normalize(pairs))
++
++    def _prune_dead_states(self) -> None:
++        incoming: Dict[int, Set[int]] = {}
++        for state_id, row in enumerate(self.transitions):
++            for target in row.values():
++                incoming.setdefault(target, set()).add(state_id)
++        self.live: Set[int] = set(self.finals)
++        stack = list(self.finals)
++        while stack:
++            state_id = stack.pop()
++            for source in incoming.get(state_id, ()):
++                if source not in self.live:
++                    self.live.add(source)
++                    stack.append(source)
++
++    def step(self, state: int, code_point: int) -> int:
++        if state == DEAD_STATE:
++            return DEAD_STATE
++        interval_index = bisect_right(self.interval_starts, code_point) - 1
++        target = self.transitions[state].get(interval_index, DEAD_STATE)
++        if target == DEAD_STATE or target not in self.live:
++            return DEAD_STATE
++        return target
++
++    def is_final(self, state: int) -> bool:
++        return state in self.finals
++
++    def fullmatch(self, text: str) -> bool:
++        state = self.initial
++        for char in text:
++            state = self.step(state, ord(char))
++            if state == DEAD_STATE:
++                return False
++        return state in self.finals
++
++    def allowed_ranges(self, state: int) -> RangeSet:
++        if state == DEAD_STATE:
++            return ranges.EMPTY
++        return self.allowed[state]
++
++
++_program_cache: Dict[str, RegexProgram] = {}
++
++
++def compile_pattern(pattern: str) -> RegexProgram:
++    program = _program_cache.get(pattern)
++    if program is None:
++        program = RegexProgram(pattern)
++        _program_cache[pattern] = program
++    return program
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/jsonschemaparser.py submission/lmformatenforcer/jsonschemaparser.py
+--- lmformatenforcer/jsonschemaparser.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/jsonschemaparser.py	2026-10-15 08:22:38
+@@ -17,6 +17,8 @@
+     ANY_JSON_OBJECT_SCHEMA: JsonSchemaObject = JsonSchemaObject(**_ANY_JSON_SCHEMA_DICT)
+     class _Context:
+         model_class: JsonSchemaObject
++        json_schema: Optional[dict] = None
++        skip_regex_parsers: bool = False
+         # We store the active parser in the context, so that if a node adds to the stack, it knows
+         # to which parser's stack to add.
+         active_parser: "JsonSchemaParser"
+@@ -42,6 +44,7 @@
+         else:
+             self.context = JsonSchemaParser._Context()
+             json_schema = json_schema or _ANY_JSON_SCHEMA_DICT
++            self.context.json_schema = json_schema
+             self.context.model_class = JsonSchemaObject(**json_schema)
+             self.context.active_parser = self
+             self.context.alphabet_without_quotes = self.config.alphabet.replace('"', '')
+@@ -333,6 +336,7 @@
+                 key_parser = StringParsingState(
+                     self.root, possible_keys, require_opening_quote=True, require_closing_quote=True
+                 )
++                key_parser.is_json_key = True
+                 key_parser = key_parser.add_character('"')
+                 self.root.context.active_parser.object_stack.append(key_parser)
+                 self.current_stage = ObjectParsingStage.PARSING_KEY_VALUE_SEPARATOR
+@@ -510,7 +514,11 @@
+     min_length: Optional[int]
+     max_length: Optional[int]
+     pattern: Optional[str]
++    original_pattern: Optional[str]
++    """The pattern as the schema wrote it, before the anchors were removed."""
+     regex_parser: Optional[RegexParser]
++    is_json_key: bool = False
++    """True for parsers that read a property name rather than a value."""
+ 
+     def __init__(
+         self,
+@@ -532,6 +540,7 @@
+         self.min_length = min_length
+         self.max_length = max_length
+         self.pattern = pattern
++        self.original_pattern = pattern
+         if self.pattern and (self.min_length or self.max_length):
+             raise LMFormatEnforcerException("String schema contains both a pattern and a min/max length, which is not currently supported")
+         # We implicitly force the string to match the entire regex, so leading ^ and trailing $ are reduntant.
+@@ -540,7 +549,7 @@
+         if self.pattern and self.pattern.endswith("$"):
+             self.pattern = self.pattern[:-1]
+         self.regex_parser = regex_parser
+-        if self.pattern and not regex_parser:
++        if self.pattern and not regex_parser and not getattr(self.root.context, 'skip_regex_parsers', False):
+             if self.pattern not in self.root.context.regex_parser_cache:
+                 self.root.context.regex_parser_cache[self.pattern] = RegexParser(self.pattern, self.root.config)
+             self.regex_parser = self.root.context.regex_parser_cache[self.pattern]
+@@ -560,6 +569,8 @@
+         clone.parsed_string = self.parsed_string
+         clone.seen_closing_quote = self.seen_closing_quote
+         clone.seen_opening_quote = self.seen_opening_quote
++        clone.is_json_key = self.is_json_key
++        clone.original_pattern = self.original_pattern
+         return clone
+ 
+     def add_character(self, new_character: str):
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/regexparser.py submission/lmformatenforcer/regexparser.py
+--- lmformatenforcer/regexparser.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/regexparser.py	2026-10-15 08:22:38
+@@ -12,6 +12,7 @@
+ 
+     class _Context:
+         pattern: interegular.FSM
++        pattern_string: str
+         anything_else_characters: str
+         state_character_cache: Dict[int, str]
+     
+@@ -23,6 +24,7 @@
+         if isinstance(pattern, str):
+             self.context = RegexParser._Context()
+             self.context.pattern = interegular.parse_pattern(pattern).to_fsm()
++            self.context.pattern_string = pattern
+             self.context.state_character_cache = {}
+             self._update_alphabet(self.config.alphabet)
+         else:
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/tokenbytes.py submission/lmformatenforcer/tokenbytes.py
+--- lmformatenforcer/tokenbytes.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/tokenbytes.py	2026-10-15 08:22:38
+@@ -0,0 +1,137 @@
++"""Reading the exact bytes of every token out of a ``tokenizers.Tokenizer``.
++
++Token masks can only be exact when the bytes that each token adds to the output
++are known, because byte level vocabularies contain tokens that hold part of a
++UTF-8 character. Two vocabulary families are supported:
++
++* byte level BPE (GPT-2 style), where each character of a token maps to one
++  byte through the byte to unicode table, and
++* SentencePiece style BPE with byte fallback (Llama style), where a piece of
++  the form ``<0xNN>`` is a single byte and every other piece is its UTF-8
++  encoding with ``U+2581`` standing for a space.
++"""
++import json
++from functools import lru_cache
++from typing import Any, Dict, Optional, Set
++
++__all__ = ['token_bytes_from_tokenizer']
++
++_SENTENCEPIECE_SPACE = '▁'
++_HEX_DIGITS = '0123456789abcdefABCDEF'
++
++
++@lru_cache(maxsize=1)
++def _unicode_to_byte() -> Dict[str, int]:
++    """The inverse of the byte to unicode table of byte level BPE vocabularies."""
++    printable = (list(range(ord('!'), ord('~') + 1))
++                 + list(range(ord('¡'), ord('¬') + 1))
++                 + list(range(ord('®'), ord('ÿ') + 1)))
++    code_points = printable[:]
++    extra = 0
++    for byte in range(256):
++        if byte not in printable:
++            printable.append(byte)
++            code_points.append(256 + extra)
++            extra += 1
++    return {chr(code_point): byte for byte, code_point in zip(printable, code_points)}
++
++
++def _tokenizer_description(tokenizer: Any) -> Dict[str, Any]:
++    """The tokenizer as a dictionary, from its own serialisation if possible."""
++    try:
++        return json.loads(tokenizer.to_str())
++    except Exception:  # noqa: BLE001
++        pass
++    # Fall back to what the object model exposes, which is enough to tell the
++    # two supported families apart.
++    decoder = getattr(tokenizer, 'decoder', None)
++    model = getattr(tokenizer, 'model', None)
++    return {
++        'decoder': {'type': type(decoder).__name__} if decoder is not None else None,
++        'model': {'type': type(model).__name__,
++                  'byte_fallback': bool(getattr(model, 'byte_fallback', False))},
++    }
++
++
++def _has_byte_level_decoder(decoder: Optional[Dict[str, Any]]) -> bool:
++    if not isinstance(decoder, dict):
++        return False
++    kind = decoder.get('type')
++    if kind == 'ByteLevel':
++        return True
++    if kind == 'Sequence':
++        return any(_has_byte_level_decoder(child) for child in decoder.get('decoders') or [])
++    return False
++
++
++def _uses_byte_fallback(description: Dict[str, Any]) -> bool:
++    model = description.get('model') or {}
++    if model.get('byte_fallback'):
++        return True
++    decoder = description.get('decoder')
++    return _mentions_byte_fallback(decoder)
++
++
++def _mentions_byte_fallback(decoder: Optional[Dict[str, Any]]) -> bool:
++    if not isinstance(decoder, dict):
++        return False
++    if decoder.get('type') == 'ByteFallback':
++        return True
++    if decoder.get('type') == 'Sequence':
++        return any(_mentions_byte_fallback(child) for child in decoder.get('decoders') or [])
++    return False
++
++
++def _special_token_ids(tokenizer: Any) -> Set[int]:
++    special: Set[int] = set()
++    try:
++        added = tokenizer.get_added_tokens_decoder()
++    except Exception:  # noqa: BLE001
++        return special
++    for token_id, token in added.items():
++        if getattr(token, 'special', False):
++            special.add(token_id)
++    return special
++
++
++def _byte_level_token_bytes(piece: str, table: Dict[str, int]) -> bytes:
++    try:
++        return bytes(table[character] for character in piece)
++    except KeyError as error:
++        raise ValueError(
++            f"Token {piece!r} is not a byte level piece: {error} has no byte") from error
++
++
++def _byte_fallback_token_bytes(piece: str) -> bytes:
++    if (len(piece) == 6 and piece.startswith('<0x') and piece.endswith('>')
++            and piece[3] in _HEX_DIGITS and piece[4] in _HEX_DIGITS):
++        return bytes((int(piece[3:5], 16),))
++    return piece.replace(_SENTENCEPIECE_SPACE, ' ').encode('utf-8')
++
++
++def token_bytes_from_tokenizer(tokenizer: Any) -> Dict[int, bytes]:
++    """The exact bytes that every regular token of ``tokenizer`` contributes.
++
++    :param tokenizer: A ``tokenizers.Tokenizer``.
++    :return: A mapping from token id to bytes, for every id of
++        ``tokenizer.get_vocab(with_added_tokens=False)`` that is not a special
++        added token.
++    :raises ValueError: If the vocabulary is neither byte level BPE nor
++        SentencePiece style BPE with byte fallback.
++    """
++    tokenizer = getattr(tokenizer, 'backend_tokenizer', tokenizer)
++    description = _tokenizer_description(tokenizer)
++    vocabulary = tokenizer.get_vocab(with_added_tokens=False)
++    special = _special_token_ids(tokenizer)
++    if _has_byte_level_decoder(description.get('decoder')):
++        table = _unicode_to_byte()
++        return {token_id: _byte_level_token_bytes(piece, table)
++                for piece, token_id in vocabulary.items() if token_id not in special}
++    if _uses_byte_fallback(description):
++        return {token_id: _byte_fallback_token_bytes(piece)
++                for piece, token_id in vocabulary.items() if token_id not in special}
++    raise ValueError(
++        "token_bytes_from_tokenizer supports byte level BPE vocabularies and "
++        "SentencePiece style BPE vocabularies with byte fallback, but this "
++        f"tokenizer uses neither (decoder: {(description.get('decoder') or {}).get('type')}, "
++        f"model: {(description.get('model') or {}).get('type')})")
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/tokenenforcer.py submission/lmformatenforcer/tokenenforcer.py
+--- lmformatenforcer/tokenenforcer.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/tokenenforcer.py	2026-10-15 08:22:38
+@@ -7,6 +7,8 @@
+ from .characterlevelparser import CharacterLevelParser, ForceStopParser, CharacterLevelParserConfig
+ from .tokenizerprefixtree import TokenizerPrefixTree, TokenizerPrefixTreeNode
+ from .tokenlist import TokenList
++from .bytelevel.automaton import ByteVocabulary
++from .bytelevel.enforcer import ByteTokenEnforcer
+ 
+ 
+ class TokenEnforcerTokenizerData:
+@@ -17,13 +19,18 @@
+                  decoder: Callable[[List[int]], str],
+                  eos_token_id: Union[int, List[int]],
+                  use_bitmask: bool,
+-                 vocab_size: int):
++                 vocab_size: int,
++                 token_bytes: Optional[Dict[int, bytes]] = None):
+         """
+         Create the tokenizer data that the TokenEnforcer needs. This can be reused for multiple TokenEnforcers if they work with the same tokenizer.
+         :param regular_tokens: A list of tuples (token_id, token_string, is_new_word_token) for all the regular (not special) tokens in the tokenizer vocabulary.
+         Note that token_string is expected to include leading / trailing whitespaces if relevant.
+         :param decoder: A function that decodes a list of token ids into a string.
+         :param eos_token_id: The token id(s) of the end-of-string token(s).
++        :param token_bytes: Optional mapping from regular token id to the exact bytes that the token adds to the
++        generated output. Byte level BPE vocabularies contain tokens whose bytes are not valid UTF-8 on their own,
++        for example the first two bytes of a three byte character. When it is given, token masks are computed over
++        those bytes instead of over the decoded token strings, which makes them exact for such vocabularies.
+         """
+         filtered_regular_tokens = [token_tuple for token_tuple in regular_tokens if token_tuple[0] <= vocab_size]
+         self.regular_tokens = filtered_regular_tokens
+@@ -33,6 +40,12 @@
+         self.tokenizer_alphabet = "".join(token_str for token_str in self.tokenizer_tree.root.children.keys() if len(token_str) == 1)
+         self.vocab_size = vocab_size
+         self.use_bitmask = use_bitmask
++        self.token_bytes = token_bytes
++        self.byte_vocabulary: Optional[ByteVocabulary] = None
++        if token_bytes is not None:
++            known_ids = set(token_id for token_id, _, _ in filtered_regular_tokens)
++            self.byte_vocabulary = ByteVocabulary(
++                {token_id: data for token_id, data in token_bytes.items() if token_id in known_ids})
+ 
+ 
+ class TokenEnforcer:
+@@ -60,17 +73,36 @@
+         self.allowed_token_cache: Dict[Hashable, Any] = {}
+         self.use_bitmask = tokenizer_data.use_bitmask
+         self.vocab_size = tokenizer_data.vocab_size
+-        
+-        
+-        # Preserve the parser's existing config (e.g., force_json_field_order) when updating alphabet
+-        parser.config = replace(parser.config, alphabet=tokenizer_data.tokenizer_alphabet)
++        self.byte_enforcer: Optional[ByteTokenEnforcer] = None
+ 
++        if getattr(tokenizer_data, 'byte_vocabulary', None) is not None:
++            # The exact bytes of every token are known, so the mask can be computed
++            # over them. The alphabet of every parser is then every scalar value.
++            try:
++                self.byte_enforcer = ByteTokenEnforcer(tokenizer_data.byte_vocabulary,
++                                                       tokenizer_data.token_bytes,
++                                                       parser,
++                                                       self.eos_token_id,
++                                                       self.use_bitmask,
++                                                       self.vocab_size)
++            except Exception:
++                logging.basicConfig(level=logging.ERROR)  # Initialize if no loggers
++                logging.exception("LMFormatEnforcer could not use token_bytes for this parser, "
++                                  "falling back to matching decoded token strings")
++                self.byte_enforcer = None
++
++        if self.byte_enforcer is None:
++            # Preserve the parser's existing config (e.g., force_json_field_order) when updating alphabet
++            parser.config = replace(parser.config, alphabet=tokenizer_data.tokenizer_alphabet)
++
+     def get_allowed_tokens(self, token_sequence: List[int]) -> TokenList:
+         """
+         Get a list of allowed tokens, given a list of tokens that were already generated.
+         :param token_sequence: The tokens that were already generated, and the next token will be generated for.
+         :return: A list of token ids that are allowed to be selected next.
+         """
++        if self.byte_enforcer is not None:
++            return self.byte_enforcer.get_allowed_tokens(token_sequence)
+         # In order to elegantly support beam search and batching, we don't store per-batch information.
+         # Instead, we store a hash of all the states (unique token tensors) we encountered so far.
+         # When we encounter a new unique token tensor, we find the token tensor that led to it, and continue from there.

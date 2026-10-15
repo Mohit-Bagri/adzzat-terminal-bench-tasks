@@ -1,0 +1,1708 @@
+diff -ruN -x __pycache__ -x *.pyc litellm/litellm_core_utils/litellm_logging.py submission/litellm/litellm_core_utils/litellm_logging.py
+--- litellm/litellm_core_utils/litellm_logging.py	2026-10-05 21:12:19
++++ submission/litellm/litellm_core_utils/litellm_logging.py	2026-10-15 14:00:49
+@@ -116,6 +116,10 @@
+ from litellm.llms.base_llm.ocr.transformation import OCRResponse
+ from litellm.llms.base_llm.search.transformation import SearchResponse
+ from litellm.responses.utils import ResponseAPILoggingUtils
++from litellm.router_utils.midstream_continuation import (
++    capture_hop_logging_obj,
++    midstream_suppresses_success,
++)
+ from litellm.types.agents import LiteLLMSendMessageResponse
+ from litellm.types.containers.main import ContainerObject
+ from litellm.types.decisions import DecisionsResponse
+@@ -618,6 +622,9 @@
+         self.call_type = call_type
+         self.litellm_call_id = litellm_call_id
+         self.litellm_trace_id: str = litellm_trace_id if litellm_trace_id else str(uuid.uuid4())
++        # Hand this object to a mid-stream continuation waiting on this call id, so the
++        # hop's own success event can be withheld in favour of the request's single one.
++        capture_hop_logging_obj(litellm_call_id, self)
+ 
+         # Capture the pre-call *value* (not a contextvars.Token) so restoration works
+         # even if this attempt's own logging ends up dispatched onto a different
+@@ -2167,6 +2174,9 @@
+         """
+         from litellm.litellm_core_utils.thread_pool_executor import executor
+ 
++        if midstream_suppresses_success(self):
++            # One hop of a continued stream: the request logs once, with the summed totals.
++            return
+         if self._is_assembled_stream_success(result):
+             if self.model_call_details.get("has_dispatched_final_stream_success"):
+                 return
+@@ -2769,6 +2779,9 @@
+     ) -> None:
+         """Restores trace_id/session_id contextvars once this attempt's own success
+         logging (including any nested calls its callbacks trigger) is fully done."""
++        if midstream_suppresses_success(self):
++            # One hop of a continued stream: the request logs once, with the summed totals.
++            return None
+         try:
+             with post_response_phase():
+                 return self._success_handler_body(
+@@ -3210,6 +3223,9 @@
+     ) -> None:
+         """Restores trace_id/session_id contextvars once this attempt's own success
+         logging (including any nested calls its callbacks trigger) is fully done."""
++        if midstream_suppresses_success(self):
++            # One hop of a continued stream: the request logs once, with the summed totals.
++            return None
+         try:
+             with post_response_phase():
+                 return await self._async_success_handler_body(
+diff -ruN -x __pycache__ -x *.pyc litellm/litellm_core_utils/streaming_handler.py submission/litellm/litellm_core_utils/streaming_handler.py
+--- litellm/litellm_core_utils/streaming_handler.py	2026-10-05 21:12:19
++++ submission/litellm/litellm_core_utils/streaming_handler.py	2026-10-15 14:00:49
+@@ -204,6 +204,28 @@
+     return params or None
+ 
+ 
++def _in_stream_error_status(error: BaseException) -> int | None:
++    """The status code an OpenAI-shaped in-stream ``data: {"error": {...}}`` event carried.
++
++    The SDK raises a bare ``APIError`` for such an event - it has no status code of its
++    own - so the code only survives on the error body the exception was built from. Without
++    it a request error (a 4xx the caller must see) is indistinguishable from an outage.
++    """
++    for candidate in (error, error.__cause__):
++        body: Final = getattr(candidate, "body", None)
++        if not isinstance(body, Mapping):
++            continue
++        for key in ("code", "status_code", "status"):
++            value = body.get(key)
++            if isinstance(value, bool):
++                continue
++            if isinstance(value, int):
++                return value
++            if isinstance(value, str) and value.isdigit():
++                return int(value)
++    return None
++
++
+ class CustomStreamWrapper:
+     def __init__(
+         self,
+@@ -2314,13 +2336,20 @@
+ 
+         mapped_status_code: Final = _normalize_status_code(mapped_exception)
+         original_status_code: Final = _normalize_status_code(e)
+-
++        # An in-stream error event's own code outranks both: the transport succeeded, so
++        # neither exception carries the status the provider actually reported, and an
++        # exception mapper guessing a 4xx must not turn a 503 event into a client error.
++        in_stream_status: Final = _in_stream_error_status(e)
++        if in_stream_status is not None:
++            mapped_exception._midstream_status_code = in_stream_status  # pyright: ignore[reportAttributeAccessIssue]
++            if 400 <= in_stream_status < 500 and in_stream_status != 429:
++                raise mapped_exception
+         # Raise non-retriable client errors directly (skip fallback).
+         # Exception: 429 (rate-limit) IS retriable/transient — allow it
+         # through so the Router can switch to a different model group.
+-        if mapped_status_code is not None and 400 <= mapped_status_code < 500 and mapped_status_code != 429:
+-            raise mapped_exception
+-        if original_status_code is not None and 400 <= original_status_code < 500 and original_status_code != 429:
++        elif (mapped_status_code is not None and 400 <= mapped_status_code < 500 and mapped_status_code != 429) or (
++            original_status_code is not None and 400 <= original_status_code < 500 and original_status_code != 429
++        ):
+             raise mapped_exception
+ 
+         raise MidStreamFallbackError(
+File litellm/proxy/enterprise is a unknown type while file submission/litellm/proxy/enterprise is a unknown type
+diff -ruN -x __pycache__ -x *.pyc litellm/router.py submission/litellm/router.py
+--- litellm/router.py	2026-10-05 21:12:19
++++ submission/litellm/router.py	2026-10-15 14:00:49
+@@ -227,6 +227,7 @@
+     send_llm_exception_alert,
+ )
+ from litellm.router_utils.health_state_cache import DeploymentHealthCache
++from litellm.router_utils.midstream_continuation import HOP_MARKER as MIDSTREAM_HOP_MARKER
+ from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
+     DeploymentAffinityCheck,
+     warn_on_unknown_model_group_affinity_flags,
+@@ -2560,6 +2561,12 @@
+         Example usage:
+         response = router.completion(model="gpt-3.5-turbo", messages=[{"role": "user", "content": "Hey, how's it going?"}]
+         """
++        is_continuation_hop: Final = kwargs.pop(MIDSTREAM_HOP_MARKER, False) is True
++        if self._drives_midstream_continuation(model, kwargs.get("stream") is True, is_continuation_hop, kwargs):
++            # One caller-visible stream that survives a provider dying mid-answer.
++            from litellm.router_utils.midstream_drivers import run_chat_stream
++
++            return run_chat_stream(self, model, messages, kwargs)
+         try:
+             verbose_router_logger.debug("router.completion(model=%s,..)", model)
+             kwargs["model"] = model
+@@ -2808,6 +2815,12 @@
+         stream: bool = False,
+         **kwargs,
+     ):
++        is_continuation_hop: Final = kwargs.pop(MIDSTREAM_HOP_MARKER, False) is True
++        if self._drives_midstream_continuation(model, stream, is_continuation_hop, kwargs):
++            # One caller-visible stream that survives a provider dying mid-answer.
++            from litellm.router_utils.midstream_drivers import arun_chat_stream
++
++            return await arun_chat_stream(self, model, messages, kwargs)
+         try:
+             kwargs["model"] = model
+             kwargs["messages"] = messages
+@@ -2915,6 +2928,21 @@
+             "additional_headers": {**item_headers, **fallback_headers},
+         }
+ 
++    def _drives_midstream_continuation(
++        self, model: str, stream: bool, is_continuation_hop: bool, kwargs: Mapping[str, Any]
++    ) -> bool:
++        """Whether this chat-completion call is the one that drives a mid-stream continuation.
++
++        One hop of a continuation is an ordinary single-group call, and prompt-management
++        models and priority-scheduled requests take their own dispatch path before any
++        deployment is picked, so neither is wrapped.
++        """
++        if not stream or is_continuation_hop:
++            return False
++        if kwargs.get("priority") is not None or self.default_priority is not None:
++            return False
++        return not self._is_prompt_management_model(model)
++
+     async def _acompletion_streaming_iterator(
+         self,
+         model_response: CustomStreamWrapper,
+@@ -6859,6 +6887,12 @@
+             client: AsyncOpenAI | None = None,
+             **kwargs,
+         ):
++            is_continuation_hop: Final = kwargs.pop(MIDSTREAM_HOP_MARKER, False) is True
++            if call_type == "anthropic_messages" and kwargs.get("stream") is True and not is_continuation_hop:
++                # One caller-visible message lifecycle that survives a provider dying mid-answer.
++                from litellm.router_utils.midstream_drivers import arun_messages_stream
++
++                return await arun_messages_stream(self, kwargs)
+             if call_type == "assistants":
+                 return await self._pass_through_assistants_endpoint_factory(
+                     original_function=original_function,
+diff -ruN -x __pycache__ -x *.pyc litellm/router_utils/midstream_continuation.py submission/litellm/router_utils/midstream_continuation.py
+--- litellm/router_utils/midstream_continuation.py	1970-01-01 05:30:00
++++ submission/litellm/router_utils/midstream_continuation.py	2026-10-15 14:00:49
+@@ -0,0 +1,813 @@
++"""Mid-stream continuation: keep one caller-visible stream alive across provider failures.
++
++A provider that dies after it already streamed content cannot simply be replaced by a
++fallback attempt - the caller has the first half of an answer and the replacement would
++start a second one. This module drives the request itself: it asks one model group at a
++time for the answer, hands the next group the text already delivered as an assistant
++prefill, and splices every group's output into a single stream whose envelope (chunk id,
++role, finish reason, usage) looks like one provider's.
++
++Used by ``Router.acompletion``/``Router.completion`` with ``stream=True`` and by
++``Router.aanthropic_messages`` with ``stream=True``.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import threading
++import uuid
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, field
++from typing import Any, Final
++
++import litellm
++
++# The private kwarg one hop of a continuation carries so the Router's entrypoints know
++# not to wrap it again.
++HOP_MARKER: Final = "_midstream_hop"
++
++# Router metadata buckets that an attempt writes deployment-specific fields into; each hop
++# gets its own copy so one hop's bookkeeping never reaches the next.
++_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
++
++# Request kwargs that belong to the orchestration, never to a single hop.
++_DROPPED_HOP_KWARGS: Final = (
++    "model",
++    "messages",
++    "stream",
++    "disable_fallbacks",
++    HOP_MARKER,
++)
++
++# A continuation hop is a new request and needs its own logging identity; the first hop
++# keeps whatever the caller (e.g. the proxy) already built for this request.
++_FIRST_HOP_ONLY_KWARGS: Final = ("litellm_call_id", "litellm_logging_obj")
++
++
++class MidStreamContinuationError(Exception):
++    """A continuation produced output that cannot be reconciled with what the caller has."""
++
++
++# ---------------------------------------------------------------------------
++# per-hop logging control
++# ---------------------------------------------------------------------------
++#
++# Every hop of a continued stream runs as its own litellm request and would log its own
++# success event with its own usage. Only one event may reach the callbacks, carrying the
++# summed cost and tokens, so each hop's logging object is captured as it is built (keyed
++# by the call id the hop was given) and flagged; the orchestrator fires the single event
++# at the end on an unflagged copy.
++
++SUPPRESS_SUCCESS_KEY: Final = "_midstream_suppress_success"
++
++_PENDING_LOGGING_OBJS: Final[dict[str, Any]] = {}
++_PENDING_LOCK: Final = threading.Lock()
++
++
++def expect_hop_logging_obj(call_id: str) -> None:
++    """Ask to be handed the Logging object litellm builds for ``call_id``."""
++    with _PENDING_LOCK:
++        _PENDING_LOGGING_OBJS[call_id] = None
++
++
++def capture_hop_logging_obj(call_id: object, logging_obj: object) -> None:
++    """Called from ``Logging.__init__``; a no-op unless a hop is waiting for this call id."""
++    if not _PENDING_LOGGING_OBJS or not isinstance(call_id, str):
++        return
++    with _PENDING_LOCK:
++        if call_id in _PENDING_LOGGING_OBJS:
++            _PENDING_LOGGING_OBJS[call_id] = logging_obj
++
++
++def take_hop_logging_obj(call_id: str) -> Any:
++    with _PENDING_LOCK:
++        return _PENDING_LOGGING_OBJS.pop(call_id, None)
++
++
++def suppress_hop_success(logging_obj: object) -> None:
++    details: Final = getattr(logging_obj, "model_call_details", None)
++    if isinstance(details, dict):
++        details[SUPPRESS_SUCCESS_KEY] = True
++
++
++def midstream_suppresses_success(logging_obj: object) -> bool:
++    """Whether this logging object belongs to a hop whose own success event is withheld."""
++    details: Final = getattr(logging_obj, "model_call_details", None)
++    return isinstance(details, dict) and details.get(SUPPRESS_SUCCESS_KEY) is True
++
++
++def final_dispatch_clone(logging_obj: Any) -> Any:
++    """A copy of a hop's logging object that is allowed to log, with its own details dict.
++
++    Copying rather than clearing the flag keeps the hop's own dispatch - which may already
++    be scheduled on an executor or the logging worker - suppressed no matter when it runs.
++    """
++    clone: Final = copy.copy(logging_obj)
++    clone.model_call_details = dict(logging_obj.model_call_details)
++    clone.model_call_details.pop(SUPPRESS_SUCCESS_KEY, None)
++    clone.model_call_details.pop("has_dispatched_final_stream_success", None)
++    clone.streaming_chunks = []
++    clone.sync_streaming_chunks = []
++    return clone
++
++
++# ---------------------------------------------------------------------------
++# accounting
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class HopBilling:
++    """What one provider request owes, at that deployment's prices."""
++
++    prompt_tokens: int = 0
++    completion_tokens: int = 0
++    cost: float = 0.0
++
++
++@dataclass
++class Totals:
++    prompt_tokens: int = 0
++    completion_tokens: int = 0
++    cost: float = 0.0
++
++    def add(self, hop: HopBilling) -> None:
++        self.prompt_tokens += hop.prompt_tokens
++        self.completion_tokens += hop.completion_tokens
++        self.cost += hop.cost
++
++
++def _price(source: Mapping[str, Any] | None, key: str) -> float | None:
++    if not isinstance(source, Mapping):
++        return None
++    value: Final = source.get(key)
++    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
++
++
++@dataclass
++class DeploymentFacts:
++    """Everything a hop's accounting needs about the deployment that served it."""
++
++    model: str = ""
++    deployment_id: str | None = None
++    input_cost_per_token: float = 0.0
++    output_cost_per_token: float = 0.0
++    supports_assistant_prefill: bool = True
++
++
++def deployment_facts(router: Any, hidden_params: Mapping[str, Any] | None, fallback_model: str) -> DeploymentFacts:
++    hidden: Final = hidden_params if isinstance(hidden_params, Mapping) else {}
++    deployment_id: Final = hidden.get("model_id") if isinstance(hidden.get("model_id"), str) else None
++    model: str = hidden.get("litellm_model_name") if isinstance(hidden.get("litellm_model_name"), str) else ""
++    litellm_params: Mapping[str, Any] = {}
++    model_info: Mapping[str, Any] = {}
++    if deployment_id is not None:
++        for entry in router.model_list or []:
++            if not isinstance(entry, dict):
++                continue
++            info = entry.get("model_info") or {}
++            if isinstance(info, Mapping) and info.get("id") == deployment_id:
++                litellm_params = entry.get("litellm_params") or {}
++                model_info = info
++                break
++    if not model:
++        candidate = litellm_params.get("model")
++        model = candidate if isinstance(candidate, str) else fallback_model
++    prefill: Final = model_info.get("supports_assistant_prefill", litellm_params.get("supports_assistant_prefill"))
++    return DeploymentFacts(
++        model=model or fallback_model,
++        deployment_id=deployment_id,
++        input_cost_per_token=_price(litellm_params, "input_cost_per_token")
++        or _price(model_info, "input_cost_per_token")
++        or _price(litellm.model_cost.get(model or ""), "input_cost_per_token")
++        or 0.0,
++        output_cost_per_token=_price(litellm_params, "output_cost_per_token")
++        or _price(model_info, "output_cost_per_token")
++        or _price(litellm.model_cost.get(model or ""), "output_cost_per_token")
++        or 0.0,
++        supports_assistant_prefill=prefill is not False,
++    )
++
++
++def group_supports_assistant_prefill(router: Any, group: str) -> bool:
++    """False when any deployment behind ``group`` declares it cannot continue an assistant turn."""
++    for entry in router.model_list or []:
++        if not isinstance(entry, dict) or entry.get("model_name") != group:
++            continue
++        info = entry.get("model_info") or {}
++        params = entry.get("litellm_params") or {}
++        declared = info.get("supports_assistant_prefill", params.get("supports_assistant_prefill"))
++        if declared is False:
++            return False
++    return True
++
++
++def count_text_tokens(model: str, text: str) -> int:
++    if not text:
++        return 0
++    try:
++        return int(litellm.token_counter(model=model, text=text))
++    except Exception:  # noqa: BLE001  # accounting must never break the stream
++        return 0
++
++
++def count_prompt_tokens(model: str, messages: Sequence[Mapping[str, Any]]) -> int:
++    try:
++        return int(litellm.token_counter(model=model, messages=list(messages)))
++    except Exception:  # noqa: BLE001  # accounting must never break the stream
++        return 0
++
++
++def bill_failed_hop(
++    facts: DeploymentFacts,
++    messages: Sequence[Mapping[str, Any]],
++    streamed_text: str,
++    streamed_tool_name: str | None,
++    streamed_tool_args: str,
++) -> HopBilling:
++    """What a provider that streamed output and then failed owes, counted by litellm."""
++    prompt_tokens: Final = count_prompt_tokens(facts.model, messages)
++    completion_tokens: Final = (
++        count_text_tokens(facts.model, streamed_text)
++        + count_text_tokens(facts.model, streamed_tool_name or "")
++        + count_text_tokens(facts.model, streamed_tool_args)
++    )
++    return HopBilling(
++        prompt_tokens=prompt_tokens,
++        completion_tokens=completion_tokens,
++        cost=prompt_tokens * facts.input_cost_per_token + completion_tokens * facts.output_cost_per_token,
++    )
++
++
++def bill_completed_hop(facts: DeploymentFacts, prompt_tokens: int, completion_tokens: int) -> HopBilling:
++    return HopBilling(
++        prompt_tokens=prompt_tokens,
++        completion_tokens=completion_tokens,
++        cost=prompt_tokens * facts.input_cost_per_token + completion_tokens * facts.output_cost_per_token,
++    )
++
++
++# ---------------------------------------------------------------------------
++# fallback chain + failure classification
++# ---------------------------------------------------------------------------
++
++
++def continuation_groups(router: Any, model_group: str, kwargs: Mapping[str, Any]) -> list[str]:
++    """The model groups this request continues on, in order, after its first one fails."""
++    from litellm.router_utils.fallback_event_handlers import (
++        _get_fallback_target_model_group,  # pyright: ignore[reportPrivateUsage]
++        fallback_lookup_groups,
++        get_fallback_model_group_for_lookup_groups,
++    )
++
++    fallbacks: Final = kwargs.get("fallbacks") if kwargs.get("fallbacks") is not None else router.fallbacks
++    if not fallbacks:
++        return []
++    try:
++        resolved, _ = get_fallback_model_group_for_lookup_groups(
++            fallbacks=list(fallbacks), lookup_groups=fallback_lookup_groups(kwargs, model_group)
++        )
++    except Exception:  # noqa: BLE001  # a malformed chain simply means nothing to continue on
++        return []
++    if not resolved:
++        return []
++    groups: list[str] = []
++    for entry in resolved:
++        try:
++            target = _get_fallback_target_model_group(entry)
++        except Exception:  # noqa: BLE001
++            target = None
++        if isinstance(target, str) and target:
++            groups.append(target)
++    return groups
++
++
++def status_code_of(error: BaseException) -> int | None:
++    """Best-effort status for an exception raised out of a provider stream."""
++    for candidate in (error, getattr(error, "original_exception", None), error.__cause__):
++        if candidate is None:
++            continue
++        stamped = getattr(candidate, "_midstream_status_code", None)
++        if isinstance(stamped, int):
++            return stamped
++    for candidate in (error, getattr(error, "original_exception", None), error.__cause__):
++        if candidate is None:
++            continue
++        raw = getattr(candidate, "status_code", None)
++        if isinstance(raw, bool):
++            continue
++        if isinstance(raw, int):
++            return raw
++        if isinstance(raw, str) and raw.isdigit():
++            return int(raw)
++        response_status = getattr(getattr(candidate, "response", None), "status_code", None)
++        if isinstance(response_status, int):
++            return response_status
++    return None
++
++
++def is_request_error(error: BaseException) -> bool:
++    """A 4xx other than 429: the request itself is wrong, so no other provider can help."""
++    status: Final = status_code_of(error)
++    return status is not None and 400 <= status < 500 and status != 429
++
++
++def unwrap_stream_error(error: BaseException) -> BaseException:
++    """The provider exception behind litellm's internal mid-stream envelope."""
++    from litellm.exceptions import MidStreamFallbackError
++
++    if isinstance(error, MidStreamFallbackError) and error.original_exception is not None:
++        return error.original_exception
++    return error
++
++
++# ---------------------------------------------------------------------------
++# chat-completion stream merging
++# ---------------------------------------------------------------------------
++
++
++def _consume_prefix(seen_before: str, piece: str, already_delivered: str) -> tuple[str, bool]:
++    """Split ``piece`` into the part that repeats text the caller already has and the rest.
++
++    ``seen_before`` is what this provider streamed for the same field before this piece and
++    ``already_delivered`` is what the caller holds. Returns (new text, matched) where
++    ``matched`` is False when the repeat does not actually match - the provider is answering
++    something else and the stream cannot be stitched.
++    """
++    start: Final = len(seen_before)
++    overlap: Final = max(0, min(start + len(piece), len(already_delivered)) - start)
++    if overlap and already_delivered[start : start + overlap] != piece[:overlap]:
++        return "", False
++    return piece[overlap:], True
++
++
++@dataclass
++class _HopView:
++    """What the hop currently being consumed has streamed, and what it must not repeat."""
++
++    index: int = 0
++    text_already_delivered: str = ""
++    tool_args_already_delivered: str = ""
++    text_seen: str = ""
++    tool_args_seen: str = ""
++    streamed_text: str = ""
++    streamed_tool_name: str | None = None
++    streamed_tool_args: str = ""
++    streamed_any_output: bool = False
++
++
++@dataclass
++class ChatStreamMerger:
++    """Folds every hop's chunks into one chat-completion stream."""
++
++    delivered_text: str = ""
++    first_chunk_id: str | None = None
++    role_emitted: bool = False
++    tool_header_emitted: bool = False
++    tool_name: str | None = None
++    delivered_tool_args: str = ""
++    hop: _HopView = field(default_factory=_HopView)
++
++    def begin_hop(self, index: int, repeats_delivered_text: bool) -> None:
++        self.hop = _HopView(
++            index=index,
++            text_already_delivered=self.delivered_text if repeats_delivered_text else "",
++            tool_args_already_delivered=self.delivered_tool_args,
++        )
++
++    @staticmethod
++    def _first_choice(chunk: Any) -> Any:
++        choices: Final = getattr(chunk, "choices", None)
++        return choices[0] if choices else None
++
++    def process(self, chunk: Any) -> Any:
++        """Return the chunk to hand the caller, or None when it carries nothing new."""
++        choice: Final = self._first_choice(chunk)
++        if choice is None:
++            return None
++        delta: Final = getattr(choice, "delta", None)
++        finish_reason: Final = getattr(choice, "finish_reason", None)
++        content: Final = getattr(delta, "content", None) if delta is not None else None
++        tool_calls: Final = getattr(delta, "tool_calls", None) if delta is not None else None
++
++        emit_content: str | None = None
++        if content:
++            self.hop.streamed_any_output = True
++            self.hop.streamed_text += content
++            new_text, matched = _consume_prefix(self.hop.text_seen, content, self.hop.text_already_delivered)
++            self.hop.text_seen += content
++            if not matched:
++                raise MidStreamContinuationError(
++                    "continuation diverged from the text already streamed to the caller"
++                )
++            self.delivered_text += new_text
++            emit_content = new_text
++
++        emit_tool_call: dict[str, Any] | None = None
++        if tool_calls:
++            emit_tool_call = self._process_tool_call(tool_calls[0])
++
++        if finish_reason is None and not emit_content and emit_tool_call is None:
++            return None
++
++        return self._stamp(chunk, choice, delta, emit_content, emit_tool_call)
++
++    def _process_tool_call(self, tool_call: Any) -> dict[str, Any] | None:
++        """Returns the tool-call delta to emit (as a dict), or None to drop it."""
++        function: Final = getattr(tool_call, "function", None)
++        name: Final = getattr(function, "name", None) if function is not None else None
++        arguments: Final = getattr(function, "arguments", None) if function is not None else None
++        call_id: Final = getattr(tool_call, "id", None)
++
++        if name:
++            self.hop.streamed_any_output = True
++            self.hop.streamed_tool_name = name
++            if self.tool_header_emitted:
++                if self.tool_name is not None and name != self.tool_name:
++                    raise MidStreamContinuationError("continuation streamed a different tool call")
++                # The caller already has this call's header; only its arguments may still be new.
++                if not arguments:
++                    return None
++            else:
++                self.tool_header_emitted = True
++                self.tool_name = name
++                header: dict[str, Any] = {
++                    "index": 0,
++                    "id": call_id,
++                    "type": getattr(tool_call, "type", None) or "function",
++                    "function": {"name": name, "arguments": ""},
++                }
++                if arguments:
++                    new_args, matched = _consume_prefix(
++                        self.hop.tool_args_seen, arguments, self.hop.tool_args_already_delivered
++                    )
++                    self.hop.tool_args_seen += arguments
++                    self.hop.streamed_tool_args += arguments
++                    if not matched:
++                        raise MidStreamContinuationError("continuation streamed different tool-call arguments")
++                    self.delivered_tool_args += new_args
++                    header["function"]["arguments"] = new_args
++                return header
++
++        if not arguments:
++            return None
++
++        self.hop.streamed_any_output = True
++        self.hop.streamed_tool_args += arguments
++        new_args, matched = _consume_prefix(self.hop.tool_args_seen, arguments, self.hop.tool_args_already_delivered)
++        self.hop.tool_args_seen += arguments
++        if not matched:
++            raise MidStreamContinuationError("continuation streamed different tool-call arguments")
++        if not new_args:
++            return None
++        self.delivered_tool_args += new_args
++        return {"index": 0, "function": {"arguments": new_args}}
++
++    def _stamp(self, chunk: Any, choice: Any, delta: Any, emit_content: str | None, emit_tool_call: Any) -> Any:
++        """Rewrite a continuation's chunk so it belongs to the stream the caller is reading."""
++        if self.hop.index == 0:
++            # The first provider's chunks are already this stream's own; leave them untouched.
++            self._remember_envelope(chunk, delta)
++            return chunk
++
++        from litellm.types.utils import ChatCompletionDeltaToolCall, Function
++
++        if emit_content is not None and delta is not None:
++            delta.content = emit_content
++        if emit_tool_call is not None and delta is not None:
++            function_payload: Final = emit_tool_call.get("function") or {}
++            delta.tool_calls = [
++                ChatCompletionDeltaToolCall(
++                    id=emit_tool_call.get("id"),
++                    type=emit_tool_call.get("type"),
++                    index=0,
++                    function=Function(
++                        name=function_payload.get("name"),
++                        arguments=function_payload.get("arguments", ""),
++                    ),
++                )
++            ]
++        elif delta is not None and getattr(delta, "tool_calls", None):
++            delta.tool_calls = None
++
++        if self.first_chunk_id is not None:
++            chunk.id = self.first_chunk_id
++        if delta is not None and getattr(delta, "role", None):
++            if self.role_emitted:
++                delta.role = None
++        self._remember_envelope(chunk, delta)
++        return chunk
++
++    def _remember_envelope(self, chunk: Any, delta: Any) -> None:
++        if self.first_chunk_id is None:
++            chunk_id: Final = getattr(chunk, "id", None)
++            if isinstance(chunk_id, str):
++                self.first_chunk_id = chunk_id
++        if delta is not None and getattr(delta, "role", None):
++            self.role_emitted = True
++
++
++def build_continuation_messages(
++    original_messages: Sequence[Mapping[str, Any]], delivered_text: str, supports_prefill: bool
++) -> list[Any]:
++    """The messages the next group receives: the original ones, plus what the caller already has.
++
++    A group that cannot continue an assistant turn gets the original messages unchanged and
++    answers from the start. Nothing delivered yet means there is nothing to prefill either,
++    so the first attempt passes the caller's own message list straight through.
++    """
++    if not delivered_text:
++        return list(original_messages)
++    messages: Final = [copy.deepcopy(message) for message in original_messages]
++    if supports_prefill:
++        messages.append({"role": "assistant", "content": delivered_text})
++    return messages
++
++
++def hop_kwargs(base_kwargs: Mapping[str, Any], call_id: str, is_first_hop: bool) -> dict[str, Any]:
++    """One hop's kwargs: the caller's, minus the orchestration's own, with fresh bookkeeping.
++
++    The first hop is this request as the caller built it, so its logging identity and
++    metadata buckets are passed through untouched; a continuation is a new request, so it
++    gets its own call id and its own copy of the buckets an attempt writes into.
++    """
++    prepared: Final = {key: value for key, value in base_kwargs.items() if key not in _DROPPED_HOP_KWARGS}
++    if not is_first_hop:
++        for key in _FIRST_HOP_ONLY_KWARGS:
++            prepared.pop(key, None)
++        for bucket in _METADATA_BUCKETS:
++            value = prepared.get(bucket)
++            if isinstance(value, dict):
++                prepared[bucket] = copy.deepcopy(value)
++    prepared[HOP_MARKER] = True
++    prepared["disable_fallbacks"] = True
++    prepared.setdefault("litellm_call_id", call_id)
++    return prepared
++
++
++def new_call_id() -> str:
++    return str(uuid.uuid4())
++
++
++# ---------------------------------------------------------------------------
++# anthropic messages SSE handling
++# ---------------------------------------------------------------------------
++
++_REQUEST_ERROR_ANTHROPIC_TYPES: Final = frozenset(
++    {"invalid_request_error", "authentication_error", "permission_error", "not_found_error", "request_too_large"}
++)
++
++
++@dataclass
++class SSEEvent:
++    event: str
++    data: Mapping[str, Any] | None
++    raw: bytes
++
++
++class SSEFramer:
++    """Reassembles provider bytes into whole SSE frames; a partial trailing frame is dropped."""
++
++    def __init__(self) -> None:
++        self._buffer = b""
++
++    def feed(self, chunk: bytes) -> list[SSEEvent]:
++        self._buffer += chunk
++        events: list[SSEEvent] = []
++        while True:
++            index = self._buffer.find(b"\n\n")
++            index_rn = self._buffer.find(b"\r\n\r\n")
++            if index_rn != -1 and (index == -1 or index_rn < index):
++                index, width = index_rn, 4
++            elif index != -1:
++                width = 2
++            else:
++                break
++            raw = self._buffer[: index + width]
++            self._buffer = self._buffer[index + width :]
++            parsed = _parse_sse_frame(raw)
++            if parsed is not None:
++                events.append(parsed)
++        return events
++
++
++def _parse_sse_frame(raw: bytes) -> SSEEvent | None:
++    event_name = ""
++    data_parts: list[str] = []
++    for line in raw.splitlines():
++        if line.startswith(b"event:"):
++            event_name = line[len(b"event:") :].strip().decode("utf-8", "replace")
++        elif line.startswith(b"data:"):
++            data_parts.append(line[len(b"data:") :].strip().decode("utf-8", "replace"))
++    if not event_name and not data_parts:
++        return None
++    payload: Mapping[str, Any] | None = None
++    if data_parts:
++        try:
++            decoded = json.loads("".join(data_parts))
++        except ValueError:
++            decoded = None
++        if isinstance(decoded, dict):
++            payload = decoded
++    if not event_name and payload is not None:
++        candidate = payload.get("type")
++        if isinstance(candidate, str):
++            event_name = candidate
++    return SSEEvent(event=event_name, data=payload, raw=raw)
++
++
++def sse_bytes(event: str, data: Mapping[str, Any]) -> bytes:
++    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
++
++
++def anthropic_error_is_request_error(error_type: str) -> bool:
++    return error_type in _REQUEST_ERROR_ANTHROPIC_TYPES
++
++
++@dataclass
++class MessagesStreamMerger:
++    """Folds every hop's SSE events into a single Anthropic message lifecycle.
++
++    Frames that need no change are forwarded as the provider's own bytes, so a stream that
++    never fails reaches the caller byte for byte as it arrived.
++    """
++
++    delivered_text: str = ""
++    delivered_tool_input: str = ""
++    message_start: bytes | None = None
++    block0_start: bytes | None = None
++    block0_stop: bytes | None = None
++    block1_stop: bytes | None = None
++    message_delta: bytes | None = None
++    message_delta_payload: Mapping[str, Any] | None = None
++    message_stop: bytes | None = None
++    lifecycle_flushed: bool = False
++    block0_started: bool = False
++    block0_stopped: bool = False
++    block1_started: bool = False
++    block1_stopped: bool = False
++    tool_name: str | None = None
++    stop_reason: str = "end_turn"
++    hop: _HopView = field(default_factory=_HopView)
++
++    def begin_hop(self, index: int, repeats_delivered_text: bool) -> None:
++        self.hop = _HopView(
++            index=index,
++            text_already_delivered=self.delivered_text if repeats_delivered_text else "",
++            tool_args_already_delivered=self.delivered_tool_input,
++        )
++
++    def _flush_lifecycle(self) -> list[bytes]:
++        if self.lifecycle_flushed:
++            return []
++        self.lifecycle_flushed = True
++        out: list[bytes] = []
++        if self.message_start is not None:
++            out.append(self.message_start)
++        if self.block0_start is not None:
++            out.append(self.block0_start)
++            self.block0_started = True
++        return out
++
++    def process(self, event: SSEEvent) -> list[bytes]:
++        """Everything the caller should see for this provider event."""
++        kind: Final = event.event
++        data: Final = event.data or {}
++        if kind == "message_start":
++            if self.message_start is None:
++                self.message_start = event.raw
++            return []
++        if kind == "content_block_start":
++            return self._content_block_start(event, data)
++        if kind == "content_block_delta":
++            return self._content_block_delta(event, data)
++        if kind == "content_block_stop":
++            if data.get("index") == 1:
++                self.block1_stop = event.raw
++            else:
++                self.block0_stop = event.raw
++            return []
++        if kind == "message_stop":
++            self.message_stop = event.raw
++            return []
++        if kind == "message_delta":
++            reason = (data.get("delta") or {}).get("stop_reason")
++            if isinstance(reason, str):
++                self.stop_reason = reason
++            self.message_delta = event.raw
++            self.message_delta_payload = data
++            return []
++        if kind == "ping":
++            # A keepalive carries no lifecycle, so it reaches the caller as it arrives.
++            return [event.raw]
++        return []
++
++    def _content_block_start(self, event: SSEEvent, data: Mapping[str, Any]) -> list[bytes]:
++        index: Final = data.get("index")
++        block: Final = data.get("content_block") or {}
++        if index == 0 or block.get("type") == "text":
++            if self.block0_start is None:
++                self.block0_start = event.raw
++            return []
++        # tool_use block
++        self.hop.streamed_any_output = True
++        name: Final = block.get("name")
++        if isinstance(name, str):
++            self.hop.streamed_tool_name = name
++        if self.block1_started:
++            if isinstance(name, str) and self.tool_name is not None and name != self.tool_name:
++                raise MidStreamContinuationError("continuation streamed a different tool_use block")
++            return []
++        out: Final = self._flush_lifecycle()
++        if self.block0_started and not self.block0_stopped:
++            self.block0_stopped = True
++            out.append(self.block0_stop or sse_bytes("content_block_stop", {"type": "content_block_stop", "index": 0}))
++        self.block1_started = True
++        self.tool_name = name if isinstance(name, str) else None
++        out.append(event.raw)
++        return out
++
++    def _content_block_delta(self, event: SSEEvent, data: Mapping[str, Any]) -> list[bytes]:
++        delta: Final = data.get("delta") or {}
++        if delta.get("type") == "input_json_delta":
++            piece = delta.get("partial_json")
++            if not isinstance(piece, str) or not piece:
++                return []
++            self.hop.streamed_any_output = True
++            self.hop.streamed_tool_args += piece
++            new_piece, matched = _consume_prefix(
++                self.hop.tool_args_seen, piece, self.hop.tool_args_already_delivered
++            )
++            self.hop.tool_args_seen += piece
++            if not matched:
++                raise MidStreamContinuationError("continuation streamed a different tool_use input")
++            if not new_piece:
++                return []
++            self.delivered_tool_input += new_piece
++            out: Final = self._flush_lifecycle()
++            out.append(
++                sse_bytes(
++                    "content_block_delta",
++                    {
++                        "type": "content_block_delta",
++                        "index": data.get("index", 1),
++                        "delta": {"type": "input_json_delta", "partial_json": new_piece},
++                    },
++                )
++            )
++            return out
++
++        text = delta.get("text")
++        if not isinstance(text, str) or not text:
++            return []
++        self.hop.streamed_any_output = True
++        self.hop.streamed_text += text
++        new_text, matched = _consume_prefix(self.hop.text_seen, text, self.hop.text_already_delivered)
++        self.hop.text_seen += text
++        if not matched:
++            raise MidStreamContinuationError("continuation diverged from the text already streamed to the caller")
++        if not new_text:
++            return []
++        self.delivered_text += new_text
++        out = self._flush_lifecycle()
++        if new_text == text:
++            out.append(event.raw)
++        else:
++            out.append(
++                sse_bytes(
++                    "content_block_delta",
++                    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": new_text}},
++                )
++            )
++        return out
++
++    def finish(self, output_tokens: int, continued: bool) -> list[bytes]:
++        """The one lifecycle tail every stream ends with, the provider's own when untouched."""
++        out: Final = self._flush_lifecycle()
++        if self.block0_started and not self.block0_stopped:
++            self.block0_stopped = True
++            out.append(self.block0_stop or sse_bytes("content_block_stop", {"type": "content_block_stop", "index": 0}))
++        if self.block1_started and not self.block1_stopped:
++            self.block1_stopped = True
++            out.append(self.block1_stop or sse_bytes("content_block_stop", {"type": "content_block_stop", "index": 1}))
++        out.append(self._final_message_delta(output_tokens, continued))
++        out.append(self.message_stop or sse_bytes("message_stop", {"type": "message_stop"}))
++        return out
++
++    def _final_message_delta(self, output_tokens: int, continued: bool) -> bytes:
++        if not continued and self.message_delta is not None:
++            return self.message_delta
++        payload: Final = dict(self.message_delta_payload or {})
++        payload["type"] = "message_delta"
++        payload["delta"] = {
++            **(payload.get("delta") or {}),
++            "stop_reason": self.stop_reason,
++        }
++        payload.setdefault("delta", {}).setdefault("stop_sequence", None)
++        payload["usage"] = {**(payload.get("usage") or {}), "output_tokens": output_tokens}
++        return sse_bytes("message_delta", payload)
++
++    def flush_partial(self) -> list[bytes]:
++        """Lifecycle frames still held back when the stream ends without continuing."""
++        return self._flush_lifecycle()
+diff -ruN -x __pycache__ -x *.pyc litellm/router_utils/midstream_drivers.py submission/litellm/router_utils/midstream_drivers.py
+--- litellm/router_utils/midstream_drivers.py	1970-01-01 05:30:00
++++ submission/litellm/router_utils/midstream_drivers.py	2026-10-15 14:00:49
+@@ -0,0 +1,703 @@
++"""The loops that drive a mid-stream continuation for each of the Router's streaming APIs.
++
++One driver per entrypoint - ``Router.acompletion``, ``Router.completion`` and
++``Router.aanthropic_messages`` - each asking one model group at a time for the answer and
++handing the next group the text the caller already holds. The merging, accounting and
++per-hop logging rules they share live in ``midstream_continuation``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import time
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any, Final
++
++import litellm
++from litellm._logging import verbose_router_logger
++from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
++from litellm.router_utils.midstream_continuation import (
++    ChatStreamMerger,
++    DeploymentFacts,
++    MessagesStreamMerger,
++    MidStreamContinuationError,
++    SSEFramer,
++    Totals,
++    anthropic_error_is_request_error,
++    bill_completed_hop,
++    bill_failed_hop,
++    build_continuation_messages,
++    continuation_groups,
++    deployment_facts,
++    expect_hop_logging_obj,
++    final_dispatch_clone,
++    group_supports_assistant_prefill,
++    hop_kwargs,
++    is_request_error,
++    new_call_id,
++    suppress_hop_success,
++    take_hop_logging_obj,
++    unwrap_stream_error,
++)
++
++if TYPE_CHECKING:
++    from litellm.router import Router
++
++
++@dataclass
++class _Hop:
++    """One provider request inside a continued stream."""
++
++    index: int
++    group: str
++    messages: list[Any]
++    stream: Any = None
++    facts: DeploymentFacts = field(default_factory=DeploymentFacts)
++    logging_obj: Any = None
++    repeats_delivered_text: bool = False
++
++
++class _ContinuationBase:
++    """State shared by the chat and messages drivers."""
++
++    def __init__(self, router: Router, model_group: str, messages: Sequence[Any], kwargs: Mapping[str, Any]):
++        self.router = router
++        self.model_group = model_group
++        self.original_messages: list[Any] = list(messages)
++        self.kwargs: dict[str, Any] = dict(kwargs)
++        self.fallbacks_disabled: bool = kwargs.get("disable_fallbacks") is True
++        self.groups: list[str] = [model_group]
++        if not self.fallbacks_disabled:
++            self.groups.extend(continuation_groups(router, model_group, kwargs))
++        self.next_group_index: int = 0
++        self.totals = Totals()
++        self.hops: list[_Hop] = []
++        self.last_error: BaseException | None = None
++
++    @property
++    def spliced(self) -> bool:
++        """Whether more than one provider actually streamed into this caller's stream."""
++        return len(self.hops) > 1
++
++    # -- hop setup ----------------------------------------------------------
++    def prepare_hop(self, delivered_text: str) -> tuple[_Hop, dict[str, Any], str] | None:
++        if self.next_group_index >= len(self.groups):
++            return None
++        group: Final = self.groups[self.next_group_index]
++        self.next_group_index += 1
++        supports_prefill: Final = group_supports_assistant_prefill(self.router, group)
++        hop = _Hop(
++            index=len(self.hops),
++            group=group,
++            messages=build_continuation_messages(self.original_messages, delivered_text, supports_prefill),
++            repeats_delivered_text=bool(delivered_text) and not supports_prefill,
++        )
++        prepared: Final = hop_kwargs(self.kwargs, new_call_id(), is_first_hop=hop.index == 0)
++        call_id: Final = str(prepared["litellm_call_id"])
++        expect_hop_logging_obj(call_id)
++        return hop, prepared, call_id
++
++    def adopt_hop(self, hop: _Hop, call_id: str, stream: Any, suppress_logging: bool) -> None:
++        hop.stream = stream
++        captured: Final = take_hop_logging_obj(call_id)
++        hop.logging_obj = captured or (
++            (self.kwargs.get("litellm_logging_obj") or getattr(stream, "logging_obj", None))
++            if hop.index == 0
++            else getattr(stream, "logging_obj", None)
++        )
++        hop.facts = deployment_facts(self.router, getattr(stream, "_hidden_params", None), hop.group)
++        if hop.facts.supports_assistant_prefill is False and hop.index > 0:
++            # The group looked prefill-capable but this deployment is not; its output
++            # repeats what the caller already has.
++            hop.repeats_delivered_text = True
++        if suppress_logging and hop.logging_obj is not None:
++            suppress_hop_success(hop.logging_obj)
++        self.hops.append(hop)
++
++    def abandon_hop(self, call_id: str) -> None:
++        take_hop_logging_obj(call_id)
++
++    # -- accounting ---------------------------------------------------------
++    def bill_failed(self, hop: _Hop, merger: Any) -> None:
++        view: Final = merger.hop
++        if not view.streamed_any_output:
++            return
++        self.totals.add(
++            bill_failed_hop(
++                hop.facts,
++                hop.messages,
++                view.streamed_text,
++                view.streamed_tool_name,
++                view.streamed_tool_args,
++            )
++        )
++
++    def bill_completed(self, hop: _Hop, prompt_tokens: int, completion_tokens: int) -> None:
++        self.totals.add(bill_completed_hop(hop.facts, prompt_tokens, completion_tokens))
++
++    # -- the single success event ------------------------------------------
++    def _final_usage(self) -> Any:
++        from litellm.types.utils import Usage
++
++        usage: Final = Usage(
++            prompt_tokens=self.totals.prompt_tokens,
++            completion_tokens=self.totals.completion_tokens,
++            total_tokens=self.totals.prompt_tokens + self.totals.completion_tokens,
++        )
++        usage.cost = self.totals.cost
++        return usage
++
++    def assembled_response(self, merger: Any, finish_reason: str, tool_call_id: str | None) -> Any:
++        from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
++
++        tool_calls = None
++        if tool_call_id is not None or getattr(merger, "tool_name", None):
++            tool_calls = [
++                ChatCompletionMessageToolCall(
++                    id=tool_call_id,
++                    type="function",
++                    function=Function(
++                        name=getattr(merger, "tool_name", None) or "",
++                        arguments=getattr(merger, "delivered_tool_args", "")
++                        or getattr(merger, "delivered_tool_input", ""),
++                    ),
++                )
++            ]
++        last_hop: Final = self.hops[-1]
++        response: Final = ModelResponse(
++            id=getattr(merger, "first_chunk_id", None) or f"chatcmpl-{new_call_id()}",
++            created=int(time.time()),
++            model=last_hop.facts.model,
++            object="chat.completion",
++            choices=[
++                Choices(
++                    finish_reason=finish_reason,
++                    index=0,
++                    message=Message(
++                        content=merger.delivered_text,
++                        role="assistant",
++                        tool_calls=tool_calls,
++                    ),
++                )
++            ],
++        )
++        response.usage = self._final_usage()  # pyright: ignore[reportAttributeAccessIssue]
++        response._hidden_params = {
++            "response_cost": self.totals.cost,
++            "model_id": last_hop.facts.deployment_id,
++        }
++        return response
++
++    def _logging_clone(self) -> Any:
++        for hop in reversed(self.hops):
++            if hop.logging_obj is not None:
++                return final_dispatch_clone(hop.logging_obj)
++        return None
++
++    def _prime_clone(self, clone: Any) -> None:
++        clone.model_call_details["combined_usage_object"] = self._final_usage()
++        clone.model_call_details["response_cost"] = self.totals.cost
++        clone.stream = True
++
++    async def adispatch_success(self, response: Any) -> None:
++        clone: Final = self._logging_clone()
++        if clone is None:
++            return
++        self._prime_clone(clone)
++        try:
++            await clone.dispatch_success_handlers(
++                response, start_time=None, end_time=None, cache_hit=False, prefer_async_handlers=True
++            )
++        except Exception as exc:  # noqa: BLE001  # logging must never break the caller's stream
++            verbose_router_logger.debug("mid-stream continuation success logging failed: %s", exc)
++
++    def dispatch_success(self, response: Any) -> None:
++        clone: Final = self._logging_clone()
++        if clone is None:
++            return
++        self._prime_clone(clone)
++        try:
++            clone.success_handler(response, None, None, False)
++        except Exception as exc:  # noqa: BLE001  # logging must never break the caller's stream
++            verbose_router_logger.debug("mid-stream continuation success logging failed: %s", exc)
++
++
++# ---------------------------------------------------------------------------
++# chat completions
++# ---------------------------------------------------------------------------
++
++
++class _ChatContinuation(_ContinuationBase):
++    def __init__(self, router: Router, model_group: str, messages: Sequence[Any], kwargs: Mapping[str, Any]):
++        super().__init__(router, model_group, messages, kwargs)
++        self.merger = ChatStreamMerger()
++        stream_options: Final = kwargs.get("stream_options") or {}
++        self.include_usage: bool = bool(isinstance(stream_options, Mapping) and stream_options.get("include_usage"))
++        self.finish_reason: str = "stop"
++        self.tool_call_id: str | None = None
++
++    def note_tool_id(self, chunk: Any) -> None:
++        if self.tool_call_id is not None:
++            return
++        choices: Final = getattr(chunk, "choices", None)
++        delta: Final = getattr(choices[0], "delta", None) if choices else None
++        tool_calls: Final = getattr(delta, "tool_calls", None) if delta is not None else None
++        if tool_calls:
++            call_id = getattr(tool_calls[0], "id", None)
++            if isinstance(call_id, str) and call_id:
++                self.tool_call_id = call_id
++
++    def completed_hop_usage(self, hop: _Hop, reported: Any) -> tuple[int, int]:
++        """What a provider that finished the stream reports, or what litellm counts for it."""
++        if reported is not None:
++            return (
++                int(getattr(reported, "prompt_tokens", 0) or 0),
++                int(getattr(reported, "completion_tokens", 0) or 0),
++            )
++        from litellm.router_utils.midstream_continuation import count_prompt_tokens, count_text_tokens
++
++        view: Final = self.merger.hop
++        return (
++            count_prompt_tokens(hop.facts.model, hop.messages),
++            count_text_tokens(hop.facts.model, view.streamed_text)
++            + count_text_tokens(hop.facts.model, view.streamed_tool_name or "")
++            + count_text_tokens(hop.facts.model, view.streamed_tool_args),
++        )
++
++    def final_usage_chunk(self, template: Any) -> Any:
++        if template is None or not self.spliced:
++            # Nothing was spliced, so the provider's own usage chunk is already the answer.
++            return template
++        template.usage = self._final_usage()
++        if self.merger.first_chunk_id is not None:
++            template.id = self.merger.first_chunk_id
++        return template
++
++
++async def _aopen_chat_hop(driver: _ChatContinuation, delivered_text: str) -> _Hop | None:
++    """Open the next group's stream, skipping groups that fail before streaming anything."""
++    while True:
++        prepared: Final = driver.prepare_hop(delivered_text)
++        if prepared is None:
++            return None
++        hop, kwargs, call_id = prepared
++        try:
++            stream = await driver.router.acompletion(
++                model=hop.group, messages=hop.messages, stream=True, **kwargs
++            )
++        except BaseException as exc:  # a group that cannot even start is simply skipped
++            verbose_router_logger.debug("mid-stream continuation: %s could not start: %s", hop.group, exc)
++            driver.abandon_hop(call_id)
++            if not isinstance(exc, Exception):
++                raise
++            driver.last_error = exc
++            if driver.fallbacks_disabled or driver.next_group_index >= len(driver.groups):
++                return None
++            continue
++        driver.adopt_hop(hop, call_id, stream, suppress_logging=hop.index > 0)
++        return hop
++
++
++async def _aclose_quietly(stream: Any) -> None:
++    if stream is None:
++        return
++    with contextlib.suppress(BaseException):
++        if hasattr(stream, "aclose"):
++            await stream.aclose()
++        elif hasattr(stream, "close"):
++            stream.close()
++
++
++async def arun_chat_continuation(driver: _ChatContinuation, first_hop: _Hop):
++    """Yield one caller-visible chat stream, continuing on the next group whenever one dies."""
++    hop: _Hop | None = first_hop
++    try:
++        while hop is not None:
++            driver.merger.begin_hop(hop.index, hop.repeats_delivered_text)
++            reported_usage: Any = None
++            usage_chunk: Any = None
++            failed: BaseException | None = None
++            try:
++                async for chunk in hop.stream:
++                    chunk_usage = getattr(chunk, "usage", None)
++                    if chunk_usage is not None:
++                        reported_usage = chunk_usage
++                        usage_chunk = chunk
++                    driver.note_tool_id(chunk)
++                    emitted = driver.merger.process(chunk)
++                    if emitted is None:
++                        continue
++                    choice = emitted.choices[0] if emitted.choices else None
++                    reason = getattr(choice, "finish_reason", None) if choice is not None else None
++                    if reason is not None:
++                        driver.finish_reason = reason
++                    if chunk_usage is not None and reason is None:
++                        continue
++                    yield emitted
++            except MidStreamContinuationError:
++                raise
++            except Exception as exc:  # noqa: BLE001  # every provider failure is classified below
++                failed = unwrap_stream_error(exc)
++
++            if failed is None:
++                prompt_tokens, completion_tokens = driver.completed_hop_usage(hop, reported_usage)
++                driver.bill_completed(hop, prompt_tokens, completion_tokens)
++                if driver.include_usage:
++                    final_chunk = driver.final_usage_chunk(usage_chunk)
++                    if final_chunk is not None:
++                        yield final_chunk
++                if driver.spliced:
++                    await driver.adispatch_success(
++                        driver.assembled_response(driver.merger, driver.finish_reason, driver.tool_call_id)
++                    )
++                return
++
++            driver.bill_failed(hop, driver.merger)
++            await _aclose_quietly(hop.stream)
++            hop.stream = None
++            if (
++                is_request_error(failed)
++                or driver.fallbacks_disabled
++                or driver.next_group_index >= len(driver.groups)
++            ):
++                raise failed
++            hop = await _aopen_chat_hop(driver, driver.merger.delivered_text)
++        raise driver.last_error or RuntimeError("mid-stream continuation ran out of fallbacks")
++    finally:
++        for finished in driver.hops:
++            await _aclose_quietly(finished.stream)
++            finished.stream = None
++
++
++def _open_chat_hop_sync(driver: _ChatContinuation, delivered_text: str) -> _Hop | None:
++    while True:
++        prepared: Final = driver.prepare_hop(delivered_text)
++        if prepared is None:
++            return None
++        hop, kwargs, call_id = prepared
++        try:
++            stream = driver.router.completion(model=hop.group, messages=hop.messages, stream=True, **kwargs)
++        except BaseException as exc:  # a group that cannot even start is simply skipped
++            verbose_router_logger.debug("mid-stream continuation: %s could not start: %s", hop.group, exc)
++            driver.abandon_hop(call_id)
++            if not isinstance(exc, Exception):
++                raise
++            driver.last_error = exc
++            if driver.fallbacks_disabled or driver.next_group_index >= len(driver.groups):
++                return None
++            continue
++        driver.adopt_hop(hop, call_id, stream, suppress_logging=hop.index > 0)
++        return hop
++
++
++def _close_quietly(stream: Any) -> None:
++    if stream is None:
++        return
++    with contextlib.suppress(BaseException):
++        if hasattr(stream, "close"):
++            stream.close()
++
++
++def run_chat_continuation(driver: _ChatContinuation, first_hop: _Hop):
++    """The synchronous twin of :func:`arun_chat_continuation`."""
++    hop: _Hop | None = first_hop
++    try:
++        while hop is not None:
++            driver.merger.begin_hop(hop.index, hop.repeats_delivered_text)
++            reported_usage: Any = None
++            usage_chunk: Any = None
++            failed: BaseException | None = None
++            try:
++                for chunk in hop.stream:
++                    chunk_usage = getattr(chunk, "usage", None)
++                    if chunk_usage is not None:
++                        reported_usage = chunk_usage
++                        usage_chunk = chunk
++                    driver.note_tool_id(chunk)
++                    emitted = driver.merger.process(chunk)
++                    if emitted is None:
++                        continue
++                    choice = emitted.choices[0] if emitted.choices else None
++                    reason = getattr(choice, "finish_reason", None) if choice is not None else None
++                    if reason is not None:
++                        driver.finish_reason = reason
++                    if chunk_usage is not None and reason is None:
++                        continue
++                    yield emitted
++            except MidStreamContinuationError:
++                raise
++            except Exception as exc:  # noqa: BLE001  # every provider failure is classified below
++                failed = unwrap_stream_error(exc)
++
++            if failed is None:
++                prompt_tokens, completion_tokens = driver.completed_hop_usage(hop, reported_usage)
++                driver.bill_completed(hop, prompt_tokens, completion_tokens)
++                if driver.include_usage:
++                    final_chunk = driver.final_usage_chunk(usage_chunk)
++                    if final_chunk is not None:
++                        yield final_chunk
++                if driver.spliced:
++                    driver.dispatch_success(
++                        driver.assembled_response(driver.merger, driver.finish_reason, driver.tool_call_id)
++                    )
++                return
++
++            driver.bill_failed(hop, driver.merger)
++            _close_quietly(hop.stream)
++            hop.stream = None
++            if (
++                is_request_error(failed)
++                or driver.fallbacks_disabled
++                or driver.next_group_index >= len(driver.groups)
++            ):
++                raise failed
++            hop = _open_chat_hop_sync(driver, driver.merger.delivered_text)
++        raise driver.last_error or RuntimeError("mid-stream continuation ran out of fallbacks")
++    finally:
++        for finished in driver.hops:
++            _close_quietly(finished.stream)
++            finished.stream = None
++
++
++# ---------------------------------------------------------------------------
++# anthropic messages
++# ---------------------------------------------------------------------------
++
++
++class _MessagesContinuation(_ContinuationBase):
++    def __init__(self, router: Router, model_group: str, messages: Sequence[Any], kwargs: Mapping[str, Any]):
++        super().__init__(router, model_group, messages, kwargs)
++        self.merger = MessagesStreamMerger()
++        self.tool_block_id: str | None = None
++
++    def completed_hop_usage(self, hop: _Hop, input_tokens: int | None, output_tokens: int | None) -> tuple[int, int]:
++        from litellm.router_utils.midstream_continuation import count_prompt_tokens, count_text_tokens
++
++        view: Final = self.merger.hop
++        prompt_tokens: Final = (
++            input_tokens if input_tokens is not None else count_prompt_tokens(hop.facts.model, hop.messages)
++        )
++        completion_tokens: Final = (
++            output_tokens
++            if output_tokens is not None
++            else count_text_tokens(hop.facts.model, view.streamed_text)
++            + count_text_tokens(hop.facts.model, view.streamed_tool_name or "")
++            + count_text_tokens(hop.facts.model, view.streamed_tool_args)
++        )
++        return prompt_tokens, completion_tokens
++
++
++async def _aopen_messages_hop(driver: _MessagesContinuation, delivered_text: str) -> _Hop | None:
++    while True:
++        prepared: Final = driver.prepare_hop(delivered_text)
++        if prepared is None:
++            return None
++        hop, kwargs, call_id = prepared
++        try:
++            stream = await driver.router.aanthropic_messages(
++                model=hop.group, messages=hop.messages, stream=True, **kwargs
++            )
++        except BaseException as exc:  # a group that cannot even start is simply skipped
++            verbose_router_logger.debug("mid-stream continuation: %s could not start: %s", hop.group, exc)
++            driver.abandon_hop(call_id)
++            if not isinstance(exc, Exception):
++                raise
++            driver.last_error = exc
++            if driver.fallbacks_disabled or driver.next_group_index >= len(driver.groups):
++                return None
++            continue
++        driver.adopt_hop(hop, call_id, stream, suppress_logging=True)
++        return hop
++
++
++def _anthropic_error_type(payload: Mapping[str, Any] | None) -> str:
++    error: Final = (payload or {}).get("error") or {}
++    raw: Final = error.get("type") if isinstance(error, Mapping) else None
++    return raw if isinstance(raw, str) else "api_error"
++
++
++async def arun_messages_continuation(driver: _MessagesContinuation, first_hop: _Hop):
++    """Yield one Anthropic message lifecycle, continuing on the next group whenever one dies."""
++    hop: _Hop | None = first_hop
++    try:
++        while hop is not None:
++            driver.merger.begin_hop(hop.index, hop.repeats_delivered_text)
++            framer = SSEFramer()
++            input_tokens: int | None = None
++            output_tokens: int | None = None
++            completed = False
++            failed: BaseException | None = None
++            error_event: Any = None
++            try:
++                async for raw in hop.stream:
++                    if not isinstance(raw, (bytes, bytearray)):
++                        continue
++                    for event in framer.feed(bytes(raw)):
++                        if event.event == "error":
++                            error_event = event
++                            break
++                        if event.event == "message_start":
++                            usage = ((event.data or {}).get("message") or {}).get("usage") or {}
++                            candidate = usage.get("input_tokens")
++                            if isinstance(candidate, int):
++                                input_tokens = candidate
++                        elif event.event == "message_delta":
++                            usage = (event.data or {}).get("usage") or {}
++                            candidate = usage.get("output_tokens")
++                            if isinstance(candidate, int):
++                                output_tokens = candidate
++                        elif event.event == "message_stop":
++                            completed = True
++                        elif event.event == "content_block_start" and driver.tool_block_id is None:
++                            block = (event.data or {}).get("content_block") or {}
++                            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
++                                driver.tool_block_id = block["id"]
++                        for out in driver.merger.process(event):
++                            yield out
++                    if error_event is not None:
++                        break
++            except MidStreamContinuationError:
++                raise
++            except Exception as exc:  # noqa: BLE001  # every provider failure is classified below
++                failed = exc
++
++            if error_event is not None:
++                error_type = _anthropic_error_type(error_event.data)
++                request_error = anthropic_error_is_request_error(error_type)
++                driver.bill_failed(hop, driver.merger)
++                await _aclose_quietly(hop.stream)
++                hop.stream = None
++                if request_error or driver.fallbacks_disabled or driver.next_group_index >= len(driver.groups):
++                    for pending in driver.merger.flush_partial():
++                        yield pending
++                    yield error_event.raw
++                    return
++                hop = await _aopen_messages_hop(driver, driver.merger.delivered_text)
++                continue
++
++            if failed is None and completed:
++                prompt_tokens, completion_tokens = driver.completed_hop_usage(hop, input_tokens, output_tokens)
++                driver.bill_completed(hop, prompt_tokens, completion_tokens)
++                for out in driver.merger.finish(driver.totals.completion_tokens, driver.spliced):
++                    yield out
++                await driver.adispatch_success(
++                    driver.assembled_response(driver.merger, driver.merger.stop_reason, driver.tool_block_id)
++                )
++                return
++
++            driver.bill_failed(hop, driver.merger)
++            await _aclose_quietly(hop.stream)
++            hop.stream = None
++            if (
++                (failed is not None and is_request_error(failed))
++                or driver.fallbacks_disabled
++                or driver.next_group_index >= len(driver.groups)
++            ):
++                for pending in driver.merger.flush_partial():
++                    yield pending
++                raise failed or litellm.APIConnectionError(
++                    message="provider stream ended before the message completed",
++                    model=hop.group,
++                    llm_provider="anthropic",
++                )
++            hop = await _aopen_messages_hop(driver, driver.merger.delivered_text)
++        raise driver.last_error or RuntimeError("mid-stream continuation ran out of fallbacks")
++    finally:
++        for finished in driver.hops:
++            await _aclose_quietly(finished.stream)
++            finished.stream = None
++
++
++# ---------------------------------------------------------------------------
++# caller-facing stream objects
++# ---------------------------------------------------------------------------
++
++
++class ContinuationStreamWrapper(CustomStreamWrapper):
++    """A chat stream the caller reads exactly like a provider's own."""
++
++    fallback_headers_adopted: bool = False
++
++    def __init__(self, generator, template):
++        super().__init__(
++            completion_stream=generator,
++            model=template.model,
++            custom_llm_provider=getattr(template, "custom_llm_provider", None),
++            logging_obj=template.logging_obj,
++            stream_options=getattr(template, "stream_options", None),
++            _response_headers=getattr(template, "_response_headers", None),
++        )
++        self._generator = generator
++        template_hidden: Final = getattr(template, "_hidden_params", None)
++        if isinstance(template_hidden, dict):
++            self._hidden_params = dict(template_hidden)
++
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        return await self._generator.__anext__()
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        return next(self._generator)
++
++    async def aclose(self):
++        with contextlib.suppress(BaseException):
++            await self._generator.aclose()
++
++    def close(self):
++        with contextlib.suppress(BaseException):
++            self._generator.close()
++
++
++class ContinuationMessagesStream:
++    """An Anthropic /v1/messages byte stream carrying the hidden params the proxy reads."""
++
++    def __init__(self, generator, template):
++        self._generator = generator
++        self._hidden_params = dict(getattr(template, "_hidden_params", None) or {})
++
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self) -> bytes:
++        return await self._generator.__anext__()
++
++    async def aclose(self) -> None:
++        with contextlib.suppress(BaseException):
++            await self._generator.aclose()
++
++
++# ---------------------------------------------------------------------------
++# entrypoints
++# ---------------------------------------------------------------------------
++
++
++async def arun_chat_stream(router: Router, model: str, messages: Sequence[Any], kwargs: Mapping[str, Any]):
++    driver: Final = _ChatContinuation(router, model, messages, kwargs)
++    first_hop: Final = await _aopen_chat_hop(driver, "")
++    if first_hop is None:
++        raise driver.last_error or RuntimeError(f"no deployment available for {model}")
++    return ContinuationStreamWrapper(arun_chat_continuation(driver, first_hop), first_hop.stream)
++
++
++def run_chat_stream(router: Router, model: str, messages: Sequence[Any], kwargs: Mapping[str, Any]):
++    driver: Final = _ChatContinuation(router, model, messages, kwargs)
++    first_hop: Final = _open_chat_hop_sync(driver, "")
++    if first_hop is None:
++        raise driver.last_error or RuntimeError(f"no deployment available for {model}")
++    return ContinuationStreamWrapper(run_chat_continuation(driver, first_hop), first_hop.stream)
++
++
++async def arun_messages_stream(router: Router, kwargs: Mapping[str, Any]):
++    model: Final = kwargs.get("model")
++    messages: Final = kwargs.get("messages") or []
++    driver: Final = _MessagesContinuation(router, str(model), messages, kwargs)
++    first_hop: Final = await _aopen_messages_hop(driver, "")
++    if first_hop is None:
++        raise driver.last_error or RuntimeError(f"no deployment available for {model}")
++    return ContinuationMessagesStream(arun_messages_continuation(driver, first_hop), first_hop.stream)

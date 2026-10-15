@@ -1,0 +1,1749 @@
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/__init__.py submission/lmformatenforcer/__init__.py
+--- lmformatenforcer/__init__.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/__init__.py	2026-10-15 14:36:54
+@@ -8,13 +8,15 @@
+            'TokenEnforcer',
+            'TokenEnforcerTokenizerData',
+            'LMFormatEnforcerException',
+-           'FormatEnforcerAnalyzer',]
++           'FormatEnforcerAnalyzer',
++           'token_bytes_from_tokenizer',]
+ 
+ from .characterlevelparser import CharacterLevelParser, CharacterLevelParserConfig, StringParser, UnionParser, SequenceParser
+ from .regexparser import RegexParser
+ from .jsonschemaparser import JsonSchemaParser
+ from .tokenenforcer import TokenEnforcer, TokenEnforcerTokenizerData
+ from .exceptions import LMFormatEnforcerException
++from .tokenbytes import token_bytes_from_tokenizer
+ try:
+     from .analyzer import FormatEnforcerAnalyzer
+ except ImportError as e:
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/bytelevel.py submission/lmformatenforcer/bytelevel.py
+--- lmformatenforcer/bytelevel.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/bytelevel.py	2026-10-15 14:36:54
+@@ -0,0 +1,562 @@
++"""Byte level token enforcement.
++
++`TokenEnforcer` normally matches tokens against the parsers by their decoded strings, which
++cannot express the tokens of a byte level BPE vocabulary: many of them hold only a part of a
++character. When `TokenEnforcerTokenizerData` is given the bytes of every token, the enforcer
++uses the code in this module instead, which walks a trie of the token bytes while feeding
++complete characters to the parser, and keeps the bytes of an incomplete character pending until
++a later token completes it.
++
++A token is allowed exactly when the bytes generated so far, plus the bytes of the token, are a
++strict UTF-8 prefix of a string that the parser accepts.
++"""
++import enum
++import sys
++from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
++
++from .charsets import (CharSet, EMPTY_CHARSET, SCALAR_VALUES, code_point_range,
++                       set_charset_hook, utf8_sequence_length)
++from .characterlevelparser import (CharacterLevelParser, ForceStopParser, SequenceParser,
++                                   StringParser, UnionParser)
++from .consts import BACKSLASH, WHITESPACE_CHARACTERS
++from .external.jsonschemaobject import JsonSchemaObject
++from .jsonschemaparser import (JsonSchemaParser, ListParsingState, NumberParsingState,
++                               ObjectParsingState, StringParsingState)
++from .jsonstringvalue import JsonStringValue
++from .regexcharsets import regex_can_end, regex_charset
++from .regexparser import RegexParser
++
++_WHITESPACE = CharSet.from_chars(WHITESPACE_CHARACTERS)
++_QUOTE = CharSet.from_chars('"')
++_QUOTE_AND_WHITESPACE = CharSet.from_chars('"' + WHITESPACE_CHARACTERS)
++_QUOTE_AND_BACKSLASH = CharSet.from_chars('"' + BACKSLASH)
++
++
++# --------------------------------------------------------------------------------------
++# The characters a parser allows, with every unicode scalar value as the alphabet.
++# --------------------------------------------------------------------------------------
++
++def charset_of(parser) -> CharSet:
++    """The set of characters that `parser` allows next, with the full unicode alphabet.
++
++    Only characters that keep the parser on a path to an accepting state are included, so that
++    a token that ends inside a character is allowed exactly when some character that starts with
++    its last bytes is allowed."""
++    parser_class = parser.__class__
++    handler = _HANDLERS.get(parser_class)
++    if handler is None:
++        handler = _resolve_handler(parser_class)
++    return handler(parser)
++
++
++def _resolve_handler(parser_class):
++    for base in parser_class.__mro__:
++        handler = _HANDLERS.get(base)
++        if handler is not None:
++            _HANDLERS[parser_class] = handler
++            return handler
++    _HANDLERS[parser_class] = _allowed_characters_charset
++    return _allowed_characters_charset
++
++
++def _allowed_characters_charset(parser) -> CharSet:
++    """Fallback for parsers whose allowed characters are a plain (finite) string."""
++    return CharSet.from_chars(parser.get_allowed_characters()) & SCALAR_VALUES
++
++
++def _union_charset(parser: UnionParser) -> CharSet:
++    charset = EMPTY_CHARSET
++    for option in parser.parsers:
++        charset = charset | charset_of(option)
++    return charset
++
++
++def _sequence_charset(parser: SequenceParser) -> CharSet:
++    charset = EMPTY_CHARSET
++    for option in parser.parsers:
++        charset = charset | charset_of(option)
++        if not option.can_end():
++            break
++    return charset
++
++
++def _string_parser_charset(parser: StringParser) -> CharSet:
++    return CharSet.from_chars(parser.target_str[:1])
++
++
++def _force_stop_charset(parser: ForceStopParser) -> CharSet:
++    return _WHITESPACE if parser.allow_whitespace else EMPTY_CHARSET
++
++
++def _json_schema_charset(parser: JsonSchemaParser) -> CharSet:
++    # Mirrors JsonSchemaParser.get_allowed_characters(), including its active parser bookkeeping.
++    parser.context.active_parser = parser
++    charset = EMPTY_CHARSET
++    inside_string_value = EMPTY_CHARSET
++    for state in reversed(parser.object_stack):
++        # The characters of a JSON string value are the ones the value itself allows - the limit
++        # on consecutive whitespaces applies to the structure around it, not inside it.
++        structure, in_value = _split_string_value_charset(state)
++        charset = charset | structure
++        inside_string_value = inside_string_value | in_value
++        if not state.can_end():
++            break
++    if not parser.object_stack:
++        # The parser is done, but whitespace is still accepted (as in the character level parser).
++        charset = _WHITESPACE
++    if parser.num_consecutive_whitespaces >= parser.config.max_consecutive_whitespaces:
++        charset = charset.minus(_WHITESPACE)
++    return charset | inside_string_value
++
++
++def _split_string_value_charset(state) -> Tuple[CharSet, CharSet]:
++    """The characters `state` allows, split into the ones that belong to the structure and the
++    ones that are inside a JSON string value."""
++    if _is_open_string_value(state):
++        return EMPTY_CHARSET, _string_state_charset(state)
++    state_class = state.__class__
++    if state_class is UnionParser or state_class is SequenceParser:
++        structure = EMPTY_CHARSET
++        in_value = EMPTY_CHARSET
++        for option in state.parsers:
++            option_structure, option_in_value = _split_string_value_charset(option)
++            structure = structure | option_structure
++            in_value = in_value | option_in_value
++            if state_class is SequenceParser and not option.can_end():
++                break
++        return structure, in_value
++    return charset_of(state), EMPTY_CHARSET
++
++
++def _is_open_string_value(state) -> bool:
++    """Whether `state` is a JSON string value that is being written right now."""
++    return (state.__class__ is StringParsingState and state.value_state is not None
++            and state.seen_opening_quote and not state.seen_closing_quote)
++
++
++def _string_state_charset(parser: StringParsingState) -> CharSet:
++    if not parser.seen_opening_quote:
++        return _QUOTE_AND_WHITESPACE
++    if parser.seen_closing_quote:
++        return _WHITESPACE
++    value_state = parser.value_state
++    if value_state is not None:
++        return value_state.input_charset()
++    if parser.regex_parser is not None:
++        # Quotes and backslashes are not supported inside a pattern, as in the character level parser.
++        charset = regex_charset(parser.regex_parser).minus(_QUOTE_AND_BACKSLASH)
++        if regex_can_end(parser.regex_parser):
++            charset = charset | _QUOTE
++        return charset
++    if parser.allowed_strings:
++        return CharSet.from_chars(parser.get_allowed_characters())
++    # Free text: the alphabet is every unicode scalar value, and a backslash is always allowed.
++    if parser.min_length is not None and len(parser.parsed_string) < parser.min_length:
++        return SCALAR_VALUES.minus(_QUOTE)
++    if parser.max_length is not None and len(parser.parsed_string) >= parser.max_length:
++        return _QUOTE
++    return SCALAR_VALUES
++
++
++_HANDLERS = {
++    RegexParser: regex_charset,
++    UnionParser: _union_charset,
++    SequenceParser: _sequence_charset,
++    StringParser: _string_parser_charset,
++    ForceStopParser: _force_stop_charset,
++    JsonSchemaParser: _json_schema_charset,
++    StringParsingState: _string_state_charset,
++    ObjectParsingState: _allowed_characters_charset,
++    NumberParsingState: _allowed_characters_charset,
++    ListParsingState: _allowed_characters_charset,
++    CharacterLevelParser: _allowed_characters_charset,
++}
++
++set_charset_hook(charset_of)
++
++
++# --------------------------------------------------------------------------------------
++# Keys that identify a parser state, so that token lists can be reused.
++# --------------------------------------------------------------------------------------
++
++NO_KEY = object()
++"""Returned when a parser state cannot be identified, which disables caching for it."""
++
++_pinned_objects: Dict[int, object] = {}
++
++
++def _identity(value) -> int:
++    """A stable id for an object that is not hashable (a schema, for example)."""
++    key = id(value)
++    if key not in _pinned_objects:
++        _pinned_objects[key] = value  # Keep a reference, so that the id stays unique
++    return key
++
++
++def state_key(parser) -> Hashable:
++    """A hashable value that fully determines the future behaviour of a parser state."""
++    parser_class = parser.__class__
++    if parser_class is RegexParser:
++        return ('regex', parser.context, parser.current_state)
++    if parser_class is JsonSchemaParser:
++        stack = _sequence_key(parser.object_stack)
++        if stack is NO_KEY:
++            return NO_KEY
++        return ('json', parser.context, stack, parser.num_consecutive_whitespaces,
++                parser.last_parsed_string, parser.last_non_whitespace_character)
++    if parser_class is UnionParser or parser_class is SequenceParser:
++        options = _sequence_key(parser.parsers)
++        if options is NO_KEY:
++            return NO_KEY
++        return ('union' if parser_class is UnionParser else 'sequence', options)
++    if parser_class is StringParser:
++        return ('literal', parser.target_str)
++    if parser_class is ForceStopParser:
++        return ('stop', parser.allow_whitespace)
++    if isinstance(parser, CharacterLevelParser):
++        fields = []
++        for name in sorted(parser.__dict__):
++            if name == 'root':  # A back pointer to the JsonSchemaParser, not part of the state
++                continue
++            value = _value_key(parser.__dict__[name])
++            if value is NO_KEY:
++                return NO_KEY
++            fields.append((name, value))
++        return (parser_class.__name__, tuple(fields))
++    return NO_KEY
++
++
++def _sequence_key(values: Sequence) -> Hashable:
++    keys = []
++    for value in values:
++        key = state_key(value)
++        if key is NO_KEY:
++            return NO_KEY
++        keys.append(key)
++    return tuple(keys)
++
++
++def _value_key(value) -> Hashable:
++    if value is None or isinstance(value, (bool, int, float, str, bytes)):
++        return value
++    if isinstance(value, (list, tuple)):
++        keys = []
++        for item in value:
++            key = _value_key(item)
++            if key is NO_KEY:
++                return NO_KEY
++            keys.append(key)
++        return tuple(keys)
++    if isinstance(value, (set, frozenset)):
++        keys = []
++        for item in value:
++            key = _value_key(item)
++            if key is NO_KEY:
++                return NO_KEY
++            keys.append(key)
++        return ('set', frozenset(keys))
++    if isinstance(value, CharacterLevelParser):
++        return state_key(value)
++    if isinstance(value, JsonStringValue):
++        return ('value', value.key())
++    if isinstance(value, enum.Enum):
++        return ('enum', value.__class__.__name__, value.name)
++    if isinstance(value, JsonSchemaObject):
++        return ('schema', _identity(value))
++    return NO_KEY
++
++
++# --------------------------------------------------------------------------------------
++# Per tokenizer byte level data.
++# --------------------------------------------------------------------------------------
++
++class ByteTrieNode:
++    """A node of the trie of token byte strings.
++
++    Besides the tokens that end here, a node knows how its subtree looks to the free text
++    shortcut: `characters` is the number of characters the node's byte string adds to a JSON
++    string value (-1 if it cannot be plain text in one, 0 if no token ends here), and the two
++    subtree fields summarize the same information for everything below, which lets the walk
++    skip the tokens that the shortcut has already answered."""
++    __slots__ = ('tokens', 'children', 'characters', 'subtree_other', 'subtree_max_plain')
++
++    def __init__(self):
++        self.tokens: List[int] = []
++        self.children: Dict[int, 'ByteTrieNode'] = {}
++        self.characters: int = 0
++        self.subtree_other: bool = False
++        self.subtree_max_plain: int = 0
++
++    def add(self, token_bytes: bytes, token_id: int, characters: int) -> None:
++        node = self
++        for byte in token_bytes:
++            child = node.children.get(byte)
++            if child is None:
++                child = ByteTrieNode()
++                node.children[byte] = child
++            node = child
++        node.tokens.append(token_id)
++        node.characters = characters
++
++    def summarize(self) -> None:
++        """Fill in the subtree fields of every node, deepest first."""
++        order = [self]
++        index = 0
++        while index < len(order):
++            order.extend(order[index].children.values())
++            index += 1
++        for node in reversed(order):
++            other = node.characters < 0
++            max_plain = node.characters if node.characters > 0 else 0
++            for child in node.children.values():
++                other = other or child.subtree_other
++                if child.subtree_max_plain > max_plain:
++                    max_plain = child.subtree_max_plain
++            node.subtree_other = other
++            node.subtree_max_plain = max_plain
++
++
++_NOT_PLAIN_BYTES = bytes(range(0x20)) + b'"' + b'\\'
++
++
++def plain_text_character_count(token_bytes: bytes) -> Optional[int]:
++    """How many characters a token adds to a JSON string value, counting an incomplete trailing
++    character as one, or None if the token cannot be written inside a string value as it is
++    (because it is not valid UTF-8 from a character boundary, or contains a quote, a backslash
++    or a control character)."""
++    size = len(token_bytes)
++    if not size:
++        return None
++    if len(token_bytes.translate(None, _NOT_PLAIN_BYTES)) != size:
++        return None
++    if max(token_bytes) < 0x80:
++        return size
++    position = 0
++    characters = 0
++    while position < size:
++        length = utf8_sequence_length(token_bytes[position])
++        if length == 0:
++            return None
++        if code_point_range(token_bytes[position:position + length]) is None:
++            return None
++        characters += 1
++        position += length
++    return characters
++
++
++class TokenByteData:
++    """The byte strings of every regular token, arranged for byte level enforcement."""
++
++    def __init__(self, token_bytes: Dict[int, bytes]):
++        self.token_bytes = token_bytes
++        self.root = ByteTrieNode()
++        # Tokens that are plain text inside a JSON string value are also looked up by the number
++        # of characters they add, so that a free text value does not need a trie walk at all.
++        self.text_tokens_by_length: Dict[int, List[int]] = {}
++        self.max_text_characters = 0
++        for token_id, data in token_bytes.items():
++            characters = plain_text_character_count(data)
++            self.root.add(data, token_id, -1 if characters is None else characters)
++            if characters is not None:
++                self.text_tokens_by_length.setdefault(characters, []).append(token_id)
++                if characters > self.max_text_characters:
++                    self.max_text_characters = characters
++        self.root.summarize()
++        self._text_tokens_up_to: Dict[int, List[int]] = {}
++        # The trie is walked recursively, one or two frames per byte of a token.
++        longest_token = max((len(data) for data in token_bytes.values()), default=0)
++        needed_depth = 4 * longest_token + 200
++        if sys.getrecursionlimit() < needed_depth:
++            sys.setrecursionlimit(needed_depth)
++
++    def skip_text_tokens_up_to(self, max_characters: Optional[int]) -> int:
++        """The `skip` argument of the trie walk that matches `text_tokens_up_to`."""
++        if max_characters is None or max_characters > self.max_text_characters:
++            return self.max_text_characters
++        return max(0, max_characters)
++
++    def text_tokens_up_to(self, max_characters: Optional[int]) -> List[int]:
++        """The tokens that are plain text inside a JSON string value and add at most
++        `max_characters` characters to it (all of them if `max_characters` is None)."""
++        if max_characters is None or max_characters > self.max_text_characters:
++            max_characters = self.max_text_characters
++        if max_characters <= 0:
++            return []
++        tokens = self._text_tokens_up_to.get(max_characters)
++        if tokens is None:
++            tokens = []
++            for length in range(1, max_characters + 1):
++                tokens.extend(self.text_tokens_by_length.get(length, ()))
++            tokens.sort()
++            self._text_tokens_up_to[max_characters] = tokens
++        return tokens
++
++
++# --------------------------------------------------------------------------------------
++# The allowed tokens of a parser state.
++# --------------------------------------------------------------------------------------
++
++class ByteLevelTokenCollector:
++    """Collects the tokens that a parser state allows, caching the result per state."""
++
++    CACHED_TOKENS_LIMIT = 4000000
++    """How many token ids to keep in the cache of token lists, before dropping all of them"""
++    REGEX_TRANSITIONS_LIMIT = 200000
++    """How many regex transitions to remember, before dropping all of them"""
++
++    def __init__(self, data: TokenByteData):
++        self.data = data
++        self.cache: Dict[Hashable, List[int]] = {}
++        self.cached_tokens = 0
++        # A regex state reacts to a character with nothing but a table lookup, and the trie
++        # visits the same (state, character) pair once per path that reaches it.
++        self.regex_transitions: Dict[Tuple, Tuple[CharacterLevelParser, CharSet]] = {}
++
++    def allowed_tokens(self, parser: CharacterLevelParser, pending_bytes: bytes) -> List[int]:
++        key = state_key(parser)
++        if key is NO_KEY:
++            return self._collect(parser, pending_bytes)
++        cache_key = (key, pending_bytes)
++        tokens = self.cache.get(cache_key)
++        if tokens is None:
++            tokens = self._collect(parser, pending_bytes)
++            if self.cached_tokens > self.CACHED_TOKENS_LIMIT:
++                self.cache.clear()
++                self.cached_tokens = 0
++            self.cache[cache_key] = tokens
++            self.cached_tokens += len(tokens)
++        return tokens
++
++    def _collect(self, parser: CharacterLevelParser, pending_bytes: bytes) -> List[int]:
++        if parser.__class__ is UnionParser:
++            # The language of a union is the union of the languages of its options.
++            merged: Set[int] = set()
++            for option in parser.parsers:
++                merged.update(self.allowed_tokens(option, pending_bytes))
++            return sorted(merged)
++        charset = charset_of(parser)
++        root = self.data.root
++        tokens: List[int] = list(root.tokens)
++        if pending_bytes:
++            self._walk_incomplete_character(root, parser, charset, pending_bytes, tokens, 0)
++            tokens.sort()
++            return tokens
++        remaining = _free_text_characters_left(parser)
++        if remaining is _NOT_FREE_TEXT:
++            self._walk(root, parser, charset, tokens, 0)
++        else:
++            # A free text JSON string value accepts every character, so whether a plain text
++            # token is allowed only depends on how many characters the value may still contain.
++            # The walk then only has to look at the tokens that the lists do not cover.
++            tokens.extend(self.data.text_tokens_up_to(remaining))
++            self._walk(root, parser, charset, tokens, self.data.skip_text_tokens_up_to(remaining))
++        tokens.sort()
++        return tokens
++
++    def _walk(self, node: ByteTrieNode, parser: CharacterLevelParser, charset: CharSet,
++              tokens: List[int], skip: int) -> None:
++        """Explore `node` with the parser at a character boundary.
++
++        `skip` is how many characters a plain text token may add to a JSON string value and
++        still be covered by the precalculated token lists; such tokens, and the subtrees that
++        hold nothing else, are left out here."""
++        for byte, child in node.children.items():
++            if skip and not child.subtree_other and child.subtree_max_plain <= skip:
++                continue
++            if byte < 0x80:
++                if charset.contains(byte):
++                    self._add_character(child, parser, chr(byte), tokens, skip)
++                continue
++            span = code_point_range(bytes((byte,)))
++            if span is None:
++                continue
++            first, last, _ = span
++            if not charset.intersects(first, last):
++                continue
++            if child.tokens and (not skip or child.characters < 0 or child.characters > skip):
++                tokens.extend(child.tokens)
++            self._walk_incomplete_character(child, parser, charset, bytes((byte,)), tokens, skip)
++
++    def _walk_incomplete_character(self, node: ByteTrieNode, parser: CharacterLevelParser,
++                                   charset: CharSet, prefix: bytes, tokens: List[int],
++                                   skip: int) -> None:
++        """Explore `node` with the bytes of an incomplete character pending."""
++        for byte, child in node.children.items():
++            if byte < 0x80 or byte > 0xBF:
++                continue
++            if skip and not child.subtree_other and child.subtree_max_plain <= skip:
++                continue
++            extended = prefix + bytes((byte,))
++            span = code_point_range(extended)
++            if span is None:
++                continue
++            first, last, missing = span
++            if missing == 0:
++                if charset.contains(first):
++                    self._add_character(child, parser, chr(first), tokens, skip)
++                continue
++            if not charset.intersects(first, last):
++                continue
++            if child.tokens and (not skip or child.characters < 0 or child.characters > skip):
++                tokens.extend(child.tokens)
++            self._walk_incomplete_character(child, parser, charset, extended, tokens, skip)
++
++    def _add_character(self, node: ByteTrieNode, parser: CharacterLevelParser, character: str,
++                       tokens: List[int], skip: int) -> None:
++        if parser.__class__ is RegexParser:
++            transition_key = (parser.context, parser.current_state, character)
++            transition = self.regex_transitions.get(transition_key)
++            if transition is None:
++                next_parser = parser.add_character(character)
++                transition = (next_parser, charset_of(next_parser))
++                if len(self.regex_transitions) > self.REGEX_TRANSITIONS_LIMIT:
++                    self.regex_transitions.clear()
++                self.regex_transitions[transition_key] = transition
++            next_parser, next_charset = transition
++        else:
++            next_parser = parser.add_character(character)
++            next_charset = charset_of(next_parser)
++        if not next_charset.bounds and not next_parser.can_end():
++            return  # The character leads to a state that can neither continue nor end
++        if node.tokens and (not skip or node.characters < 0 or node.characters > skip):
++            tokens.extend(node.tokens)
++        if next_charset.bounds and node.children:
++            self._walk(node, next_parser, next_charset, tokens, skip)
++
++
++_NOT_FREE_TEXT = object()
++
++
++def _free_text_characters_left(parser: CharacterLevelParser):
++    """How many characters may still be written into a free text JSON string value that is
++    open right now (None if unlimited), or `_NOT_FREE_TEXT` if there is none.
++
++    Such a value accepts every character, so every plain text token that is short enough is
++    allowed, whatever else the parser would accept."""
++    parser_class = parser.__class__
++    if parser_class is JsonSchemaParser:
++        if not parser.object_stack:
++            return _NOT_FREE_TEXT
++        return _free_text_capacity(parser.object_stack[-1])
++    if parser_class is SequenceParser:
++        return _free_text_characters_left(parser.parsers[0])
++    return _NOT_FREE_TEXT
++
++
++def _free_text_capacity(state: CharacterLevelParser):
++    if _is_open_string_value(state):
++        value_state = state.value_state
++        if value_state.is_unconstrained_text() and state.require_closing_quote:
++            return value_state.constraint.remaining_characters()
++        return _NOT_FREE_TEXT
++    if state.__class__ is UnionParser:
++        capacity = _NOT_FREE_TEXT
++        for option in state.parsers:
++            option_capacity = _free_text_capacity(option)
++            if option_capacity is _NOT_FREE_TEXT:
++                continue
++            if option_capacity is None:
++                return None
++            capacity = option_capacity if capacity is _NOT_FREE_TEXT else max(capacity, option_capacity)
++        return capacity
++    return _NOT_FREE_TEXT
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/characterlevelparser.py submission/lmformatenforcer/characterlevelparser.py
+--- lmformatenforcer/characterlevelparser.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/characterlevelparser.py	2026-10-15 14:36:54
+@@ -6,6 +6,7 @@
+                      DEFAULT_FORCE_JSON_FIELD_ORDER, CONFIG_ENV_VAR_MAX_CONSECUTIVE_WHITESPACES, 
+                      CONFIG_ENV_VAR_STRICT_JSON_FIELD_ORDER, CONFIG_ENV_VAR_MAX_JSON_ARRAY_LENGTH,
+                      DEFAULT_MAX_JSON_ARRAY_LENGTH)
++from .charsets import parser_accepts
+ 
+ 
+ def _parse_bool(s: str) -> bool:
+@@ -118,7 +119,7 @@
+ 
+     def add_character(self, new_character: str) -> CharacterLevelParser:
+         # This is a bit of a performance hit, as it means get_allowed_characters() is called twice.
+-        relevant_parsers = [parser for parser in self.parsers if new_character in parser.get_allowed_characters()]
++        relevant_parsers = [parser for parser in self.parsers if parser_accepts(parser, new_character)]
+         next_parsers = [parser.add_character(new_character) for parser in relevant_parsers]
+         if len(next_parsers) == 1:
+             return next_parsers[0]
+@@ -156,7 +157,7 @@
+         # and the second parser can also accept, we don't know which scenario we are dealing
+         # with, so we need to return a UnionParser.
+         for idx, parser in enumerate(self.parsers):
+-            if new_character in parser.get_allowed_characters():
++            if parser_accepts(parser, new_character):
+                 updated_parser = parser.add_character(new_character)
+                 next_parsers = [updated_parser] + self.parsers[idx+1:]
+                 if len(next_parsers) == 1:
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/charsets.py submission/lmformatenforcer/charsets.py
+--- lmformatenforcer/charsets.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/charsets.py	2026-10-15 14:36:54
+@@ -0,0 +1,285 @@
++"""Sets of unicode code points, and the hooks that let the existing character level parsers
++be driven with an alphabet of every unicode scalar value.
++
++Byte level token enforcement needs to know which characters a parser allows, and for
++patterns such as `[^,]` or free text JSON strings that set contains over a million
++characters. Materializing it as a string (the CharacterLevelParser interface) is not an
++option, so the byte level code works with CharSet instead, and the few places in which the
++parsers test membership of a single character delegate to `parser_accepts`, which uses the
++CharSet of the parser when the byte level engine is active.
++"""
++from bisect import bisect_right
++from typing import Callable, Iterable, Iterator, List, Optional, Tuple
++
++MAX_CODE_POINT = 0x10FFFF
++FIRST_SURROGATE = 0xD800
++LAST_SURROGATE = 0xDFFF
++
++
++class CharSet:
++    """An immutable set of unicode code points, stored as sorted, disjoint, non adjacent ranges.
++
++    The ranges are kept in a flat tuple of half open boundaries
++    (start0, end0, start1, end1, ...), which makes membership a single bisect."""
++    __slots__ = ('bounds',)
++
++    def __init__(self, bounds: Tuple[int, ...] = ()):
++        self.bounds = bounds
++
++    @staticmethod
++    def from_ranges(ranges: Iterable[Tuple[int, int]]) -> 'CharSet':
++        """Create a CharSet from (first, last) inclusive code point pairs, in any order."""
++        pairs = sorted((first, last) for first, last in ranges if first <= last)
++        bounds = []
++        for first, last in pairs:
++            if bounds and first <= bounds[-1]:
++                if last + 1 > bounds[-1]:
++                    bounds[-1] = last + 1
++            else:
++                bounds.append(first)
++                bounds.append(last + 1)
++        return CharSet(tuple(bounds))
++
++    @staticmethod
++    def from_chars(characters: Iterable[str]) -> 'CharSet':
++        """Create a CharSet from an iterable of single character strings."""
++        code_points = sorted(set(ord(character) for character in characters))
++        bounds = []
++        for code_point in code_points:
++            if bounds and code_point == bounds[-1]:
++                bounds[-1] = code_point + 1
++            else:
++                bounds.append(code_point)
++                bounds.append(code_point + 1)
++        return CharSet(tuple(bounds))
++
++    @staticmethod
++    def from_code_points(code_points: Iterable[int]) -> 'CharSet':
++        return CharSet.from_ranges((code_point, code_point) for code_point in code_points)
++
++    def contains(self, code_point: int) -> bool:
++        return bool(bisect_right(self.bounds, code_point) & 1)
++
++    def intersects(self, first: int, last: int) -> bool:
++        """Does the set contain any code point in the inclusive range [first, last]?"""
++        bounds = self.bounds
++        index = bisect_right(bounds, first)
++        if index & 1:
++            return True
++        return index < len(bounds) and bounds[index] <= last
++
++    def __bool__(self) -> bool:
++        return bool(self.bounds)
++
++    def __eq__(self, other) -> bool:
++        return isinstance(other, CharSet) and self.bounds == other.bounds
++
++    def __hash__(self) -> int:
++        return hash(self.bounds)
++
++    def __repr__(self) -> str:
++        ranges = ", ".join(f"{hex(self.bounds[i])}-{hex(self.bounds[i + 1] - 1)}"
++                           for i in range(0, len(self.bounds), 2))
++        return f"CharSet({ranges})"
++
++    def count(self) -> int:
++        bounds = self.bounds
++        return sum(bounds[i + 1] - bounds[i] for i in range(0, len(bounds), 2))
++
++    def chars(self) -> Iterator[str]:
++        bounds = self.bounds
++        for i in range(0, len(bounds), 2):
++            for code_point in range(bounds[i], bounds[i + 1]):
++                yield chr(code_point)
++
++    def __or__(self, other: 'CharSet') -> 'CharSet':
++        if not self.bounds:
++            return other
++        if not other.bounds:
++            return self
++        return CharSet(_combine(self.bounds, other.bounds, 1))
++
++    def __and__(self, other: 'CharSet') -> 'CharSet':
++        if not self.bounds or not other.bounds:
++            return EMPTY_CHARSET
++        return CharSet(_combine(self.bounds, other.bounds, 2))
++
++    def minus(self, other: 'CharSet') -> 'CharSet':
++        if not self.bounds or not other.bounds:
++            return self
++        return self & other.complement()
++
++    def complement(self) -> 'CharSet':
++        """The complement within all unicode scalar values (surrogates are never included)."""
++        return SCALAR_VALUES & CharSet(_complement_bounds(self.bounds))
++
++
++def _complement_bounds(bounds: Tuple[int, ...]) -> Tuple[int, ...]:
++    result = []
++    position = 0
++    for i in range(0, len(bounds), 2):
++        if bounds[i] > position:
++            result.append(position)
++            result.append(bounds[i])
++        position = bounds[i + 1]
++    if position <= MAX_CODE_POINT:
++        result.append(position)
++        result.append(MAX_CODE_POINT + 1)
++    return tuple(result)
++
++
++def _combine(first: Tuple[int, ...], second: Tuple[int, ...], threshold: int) -> Tuple[int, ...]:
++    """Merge two boundary tuples, keeping the code points covered by at least `threshold` of them.
++
++    Both tuples alternate between the start and the end of a range, so the parity of an index
++    says whether the boundary opens or closes a range. Walking the two tuples together with a
++    counter of how many ranges are open gives the union (threshold 1) or the intersection
++    (threshold 2). Boundaries that meet cancel out, which merges adjacent ranges."""
++    result: List[int] = []
++    index = other = 0
++    size, other_size = len(first), len(second)
++    depth = 0
++    while index < size or other < other_size:
++        if other >= other_size or (index < size and first[index] <= second[other]):
++            boundary = first[index]
++            opening = not index & 1
++            index += 1
++        else:
++            boundary = second[other]
++            opening = not other & 1
++            other += 1
++        if opening:
++            depth += 1
++            if depth != threshold:
++                continue
++        else:
++            depth -= 1
++            if depth != threshold - 1:
++                continue
++        if result and result[-1] == boundary:
++            result.pop()
++        else:
++            result.append(boundary)
++    return tuple(result)
++
++
++EMPTY_CHARSET = CharSet()
++SCALAR_VALUES = CharSet((0, FIRST_SURROGATE, LAST_SURROGATE + 1, MAX_CODE_POINT + 1))
++"""Every unicode scalar value - the alphabet that byte level enforcement uses."""
++
++
++# UTF-8 helpers. A "strict prefix" is a (possibly empty) sequence of complete characters
++# followed by at most one incomplete character.
++
++_LENGTH_RANGES = {1: (0x00, 0x7F), 2: (0x80, 0x7FF), 3: (0x800, 0xFFFF), 4: (0x10000, MAX_CODE_POINT)}
++
++
++def utf8_sequence_length(lead_byte: int) -> int:
++    """The total number of bytes of the character that starts with `lead_byte`, or 0 if it cannot."""
++    if lead_byte < 0x80:
++        return 1
++    if lead_byte < 0xC2:  # continuation bytes, and the overlong leads 0xC0 / 0xC1
++        return 0
++    if lead_byte < 0xE0:
++        return 2
++    if lead_byte < 0xF0:
++        return 3
++    if lead_byte < 0xF5:
++        return 4
++    return 0
++
++
++def code_point_range(prefix: bytes) -> Optional[Tuple[int, int, int]]:
++    """The code points whose UTF-8 encoding starts with `prefix`.
++
++    Returns (first, last, missing_bytes) where missing_bytes is how many bytes are still needed
++    to complete the character, or None if no valid character starts with these bytes."""
++    length = utf8_sequence_length(prefix[0])
++    if length == 0 or len(prefix) > length:
++        return None
++    value = prefix[0] if length == 1 else prefix[0] & (0x7F >> length)
++    for byte in prefix[1:]:
++        if byte < 0x80 or byte > 0xBF:
++            return None
++        value = (value << 6) | (byte & 0x3F)
++    missing = length - len(prefix)
++    first = value << (6 * missing)
++    last = first + (1 << (6 * missing)) - 1
++    valid_first, valid_last = _LENGTH_RANGES[length]
++    first = max(first, valid_first)
++    last = min(last, valid_last)
++    if first > last:
++        return None
++    return first, last, missing
++
++
++def utf8_strict_prefix_length(data: bytes) -> Optional[int]:
++    """The number of bytes of `data` that form complete characters, or None if `data` is not a
++    strict UTF-8 prefix (every byte must belong to a valid, possibly incomplete, character)."""
++    position = 0
++    size = len(data)
++    while position < size:
++        length = utf8_sequence_length(data[position])
++        if length == 0:
++            return None
++        chunk = data[position:position + length]
++        if code_point_range(chunk) is None:
++            return None
++        if len(chunk) < length:
++            return position
++        position += length
++    return position
++
++
++# The character level parsers test whether a single character is allowed with
++# `character in parser.get_allowed_characters()`. While the byte level engine is active the
++# tests below are answered from the parser's CharSet instead, so that characters outside the
++# configured alphabet (any multi byte character, for example) are handled correctly.
++
++_charset_hook: Optional[Callable[[object], Optional[CharSet]]] = None
++_active_depth = 0
++
++
++def set_charset_hook(hook: Callable[[object], Optional[CharSet]]) -> None:
++    global _charset_hook
++    _charset_hook = hook
++
++
++class unicode_alphabet_active:
++    """Context manager that turns on the full unicode alphabet for parser membership tests."""
++    def __enter__(self):
++        global _active_depth
++        _active_depth += 1
++        return self
++
++    def __exit__(self, *args):
++        global _active_depth
++        _active_depth -= 1
++        return False
++
++
++def is_unicode_alphabet_active() -> bool:
++    return _active_depth > 0
++
++
++def parser_charset(parser) -> Optional[CharSet]:
++    """The CharSet of a parser, if the byte level engine is active and knows this parser type."""
++    if _active_depth > 0 and _charset_hook is not None:
++        return _charset_hook(parser)
++    return None
++
++
++def parser_accepts(parser, character: str) -> bool:
++    """Whether `parser` allows `character` as its next character."""
++    charset = parser_charset(parser)
++    if charset is not None:
++        return charset.contains(ord(character))
++    return character in parser.get_allowed_characters()
++
++
++def parser_allows_nothing(parser) -> bool:
++    """Whether `parser` allows no characters at all."""
++    charset = parser_charset(parser)
++    if charset is not None:
++        return not charset
++    return parser.get_allowed_characters() == ''
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/jsonschemaparser.py submission/lmformatenforcer/jsonschemaparser.py
+--- lmformatenforcer/jsonschemaparser.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/jsonschemaparser.py	2026-10-15 14:36:54
+@@ -5,7 +5,9 @@
+ 
+ 
+ from .external.jsonschemaobject import JsonSchemaObject, json_schema_data_formats
++from .charsets import is_unicode_alphabet_active, parser_accepts, parser_allows_nothing
+ from .exceptions import LMFormatEnforcerException
++from .jsonstringvalue import JsonStringValue
+ from .characterlevelparser import CharacterLevelParser, CharacterLevelParserConfig, ForceStopParser, SequenceParser, StringParser, UnionParser
+ from .consts import BACKSLASH, BACKSLASH_ESCAPING_CHARACTERS, WHITESPACE_CHARACTERS
+ from .regexparser import RegexParser
+@@ -60,7 +62,7 @@
+         # This is different from the SequenceParser, in which we need to split (union) into all options.
+         receiving_idx = len(self.object_stack) - 1
+         last_parsed_string = self.last_parsed_string
+-        while receiving_idx >= 0 and new_character not in self.object_stack[receiving_idx].get_allowed_characters():
++        while receiving_idx >= 0 and not parser_accepts(self.object_stack[receiving_idx], new_character):
+             finished_receiver = self.object_stack[receiving_idx]
+             if isinstance(finished_receiver, StringParsingState):
+                 last_parsed_string = finished_receiver.parsed_string
+@@ -97,7 +99,7 @@
+         # For some performance optimizations to work, we want to make sure we don't leave irrelevant
+         # objects at the top of the stack, which we know will be passed over next timestep
+         new_object_stack = updated_parser.object_stack
+-        while new_object_stack and new_object_stack[-1].can_end() and new_object_stack[-1].get_allowed_characters() == '':
++        while new_object_stack and new_object_stack[-1].can_end() and parser_allows_nothing(new_object_stack[-1]):
+             finished_receiver = new_object_stack[-1]
+             if isinstance(finished_receiver, StringParsingState):
+                 updated_parser.last_parsed_string = finished_receiver.parsed_string
+@@ -141,7 +143,7 @@
+         if self.object_stack:
+             current_parser = self.object_stack[-1]
+             if isinstance(current_parser, StringParsingState):
+-                if not current_parser.allowed_strings and current_parser.seen_opening_quote and not current_parser.seen_closing_quote and not current_parser.regex_parser:
++                if not current_parser.allowed_strings and current_parser.seen_opening_quote and not current_parser.seen_closing_quote and not current_parser.regex_parser and current_parser.value_state is None:
+                     # Performance optimization: When we are parsing a string that is not from a list of allowed strings, most tokens
+                     # are legal. The exploration can be more costly than the LM itself for large tokenizers (because this is pure python),
+                     # so we signal that we are in a "freetext" mode, and reuse the allowed token list throughout the run.
+@@ -192,7 +194,8 @@
+         return StringParsingState(parsing_state, 
+                                   [allowed_value], 
+                                   require_opening_quote=is_string, 
+-                                  require_closing_quote=is_string)
++                                  require_closing_quote=is_string,
++                                  is_string_value=is_string)
+     if value_schema.type == "string":
+         return StringParsingState(
+             parsing_state,
+@@ -201,6 +204,7 @@
+             min_length=value_schema.minLength,
+             max_length=value_schema.maxLength,
+             pattern=value_schema.pattern,
++            is_string_value=True,
+         )
+     if value_schema.oneOf:
+         # We create a combined object schema for each option that includes the information from the parent
+@@ -231,6 +235,7 @@
+             parsing_state,
+             value_schema.enum,
+             require_opening_quote=True,
++            is_string_value=True,
+         )
+         elif is_numeric:
+             return StringParsingState(
+@@ -511,6 +516,8 @@
+     max_length: Optional[int]
+     pattern: Optional[str]
+     regex_parser: Optional[RegexParser]
++    is_string_value: bool
++    value_state: Optional[JsonStringValue]
+ 
+     def __init__(
+         self,
+@@ -522,8 +529,14 @@
+         max_length: Optional[int]=None,
+         pattern: Optional[str]=None,
+         regex_parser: Optional[RegexParser]=None,
++        is_string_value: bool = False,
++        value_state: Optional[JsonStringValue] = None,
+     ):
+         super().__init__(root)
++        # A string value (as opposed to a property name) follows the JSON string rules when
++        # byte level enforcement is active, see _add_json_value_character().
++        self.is_string_value = is_string_value
++        self.value_state = value_state
+         self.allowed_strings = allowed_strings
+         self.seen_closing_quote = False
+         self.seen_opening_quote = not require_opening_quote
+@@ -555,7 +568,9 @@
+             self.min_length,
+             self.max_length,
+             self.pattern,
+-            self.regex_parser
++            self.regex_parser,
++            self.is_string_value,
++            self.value_state,
+         )
+         clone.parsed_string = self.parsed_string
+         clone.seen_closing_quote = self.seen_closing_quote
+@@ -563,6 +578,9 @@
+         return clone
+ 
+     def add_character(self, new_character: str):
++        if self.value_state is not None or (self.is_string_value and not self.seen_opening_quote
++                                            and is_unicode_alphabet_active()):
++            return self._add_json_value_character(new_character)
+         if (not self.parsed_string or self.seen_closing_quote) and new_character in WHITESPACE_CHARACTERS:
+             return self
+         self = cast(StringParsingState, super().add_character(new_character))
+@@ -584,6 +602,29 @@
+             json_escaping_parser = UnionParser(escaping_character_parsers + [unicode_escape_parser])
+             self.root.context.active_parser.object_stack.append(json_escaping_parser)
+         return self
++
++    def _add_json_value_character(self, new_character: str) -> 'StringParsingState':
++        """Add a character to a JSON string value, which follows the string rules of RFC 8259,
++        with the constraints of the schema applied to the decoded value."""
++        if not self.seen_opening_quote:
++            if new_character != '"':
++                return self  # Whitespace before the value, ignored
++            new = self._clone()
++            new.seen_opening_quote = True
++            new.parsed_string = ""
++            new.value_state = JsonStringValue.create(self.allowed_strings, self.min_length,
++                                                     self.max_length, self.regex_parser)
++            return new
++        if self.seen_closing_quote:
++            return self  # Whitespace after the value, ignored
++        if new_character == '"' and self.value_state.is_outside_escape():
++            new = self._clone()
++            new.seen_closing_quote = True
++            return new
++        new = self._clone()
++        new.parsed_string += new_character
++        new.value_state = self.value_state.add_character(new_character)
++        return new
+ 
+     def get_allowed_characters(self) -> str:
+         if not self.seen_opening_quote:
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/jsonstringvalue.py submission/lmformatenforcer/jsonstringvalue.py
+--- lmformatenforcer/jsonstringvalue.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/jsonstringvalue.py	2026-10-15 14:36:54
+@@ -0,0 +1,351 @@
++"""JSON string values, parsed according to RFC 8259 with the schema constraints applied to the
++decoded value.
++
++The character level `StringParsingState` treats the characters between the quotes as the value
++itself, which is not enough for byte level enforcement: `"\\u6771\\u4eac"` and `"東京"` are the
++same value 東京, and a schema that allows 東京 has to allow both spellings (and no other). This
++module implements the escape sequences of JSON strings, and tracks which decoded values are
++still reachable, so that a character is allowed exactly when some completion of the value
++satisfies the constraints of the schema.
++"""
++from typing import Dict, Hashable, Optional, Sequence, Tuple
++
++from .charsets import CharSet, SCALAR_VALUES, FIRST_SURROGATE, LAST_SURROGATE
++from .consts import BACKSLASH, BACKSLASH_ESCAPING_CHARACTERS
++from .regexcharsets import regex_can_end, regex_charset
++
++FIRST_HIGH_SURROGATE = 0xD800
++LAST_HIGH_SURROGATE = 0xDBFF
++FIRST_LOW_SURROGATE = 0xDC00
++LAST_LOW_SURROGATE = 0xDFFF
++
++CONTROL_CHARACTERS = CharSet.from_ranges([(0x00, 0x1F)])
++RAW_CHARACTERS = SCALAR_VALUES.minus(CharSet.from_chars('"' + BACKSLASH)).minus(CONTROL_CHARACTERS)
++"""The characters that may appear between the quotes of a JSON string without an escape."""
++
++_SHORT_ESCAPES = {'"': '"', BACKSLASH: BACKSLASH, '/': '/',
++                  'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
++assert set(_SHORT_ESCAPES) == set(BACKSLASH_ESCAPING_CHARACTERS)
++
++_HEX_DIGIT_CHARACTERS = [CharSet.from_chars("0123456789abcdef"[digit] + "0123456789ABCDEF"[digit])
++                         for digit in range(16)]
++_QUOTE = CharSet.from_chars('"')
++_BACKSLASH = CharSet.from_chars(BACKSLASH)
++_UNICODE_ESCAPE_MARKER = CharSet.from_chars('u')
++
++
++class StringValueConstraint:
++    """What a schema allows the decoded value of a string to be."""
++
++    def allowed_characters(self) -> CharSet:
++        """The characters that may be appended to the decoded value."""
++        raise NotImplementedError()
++
++    def can_end(self) -> bool:
++        """Whether the decoded value is complete."""
++        raise NotImplementedError()
++
++    def add_character(self, character: str) -> 'StringValueConstraint':
++        raise NotImplementedError()
++
++    def key(self) -> Hashable:
++        raise NotImplementedError()
++
++
++class DeadValue(StringValueConstraint):
++    """A value that no completion can satisfy."""
++
++    def allowed_characters(self) -> CharSet:
++        return CharSet()
++
++    def can_end(self) -> bool:
++        return False
++
++    def add_character(self, character: str) -> StringValueConstraint:
++        return self
++
++    def key(self) -> Hashable:
++        return ('dead',)
++
++
++DEAD_VALUE = DeadValue()
++
++
++class FreeTextValue(StringValueConstraint):
++    """Any text, optionally limited by minLength / maxLength (in decoded characters)."""
++
++    def __init__(self, min_length: Optional[int], max_length: Optional[int], length: int = 0):
++        self.min_length = min_length
++        self.max_length = max_length
++        self.length = length
++
++    def allowed_characters(self) -> CharSet:
++        if self.max_length is not None and self.length >= self.max_length:
++            return CharSet()
++        return SCALAR_VALUES
++
++    def can_end(self) -> bool:
++        return self.min_length is None or self.length >= self.min_length
++
++    def add_character(self, character: str) -> StringValueConstraint:
++        if self.max_length is not None and self.length >= self.max_length:
++            return DEAD_VALUE
++        return FreeTextValue(self.min_length, self.max_length, self.length + 1)
++
++    def remaining_characters(self) -> Optional[int]:
++        """How many more characters the value may contain, or None if unlimited."""
++        if self.max_length is None:
++            return None
++        return max(0, self.max_length - self.length)
++
++    def key(self) -> Hashable:
++        missing = 0 if self.min_length is None else max(0, self.min_length - self.length)
++        remaining = -1 if self.max_length is None else max(0, self.max_length - self.length)
++        return ('free', missing, remaining)
++
++
++class EnumValue(StringValueConstraint):
++    """One of a list of values (`enum` or `const`)."""
++
++    def __init__(self, suffixes: Tuple[str, ...]):
++        self.suffixes = suffixes
++
++    @staticmethod
++    def create(values: Sequence[str], min_length: Optional[int], max_length: Optional[int]) -> StringValueConstraint:
++        suffixes = tuple(sorted(set(
++            value for value in values
++            if isinstance(value, str)
++            and (min_length is None or len(value) >= min_length)
++            and (max_length is None or len(value) <= max_length))))
++        if not suffixes:
++            return DEAD_VALUE
++        return EnumValue(suffixes)
++
++    def allowed_characters(self) -> CharSet:
++        return CharSet.from_chars(suffix[0] for suffix in self.suffixes if suffix)
++
++    def can_end(self) -> bool:
++        return any(not suffix for suffix in self.suffixes)
++
++    def add_character(self, character: str) -> StringValueConstraint:
++        suffixes = tuple(suffix[1:] for suffix in self.suffixes if suffix[:1] == character)
++        if not suffixes:
++            return DEAD_VALUE
++        return EnumValue(suffixes)
++
++    def key(self) -> Hashable:
++        return ('enum', self.suffixes)
++
++
++class PatternValue(StringValueConstraint):
++    """A value that has to fully match a regular expression."""
++
++    def __init__(self, regex_parser):
++        self.regex_parser = regex_parser
++
++    def allowed_characters(self) -> CharSet:
++        return regex_charset(self.regex_parser)
++
++    def can_end(self) -> bool:
++        return regex_can_end(self.regex_parser)
++
++    def add_character(self, character: str) -> StringValueConstraint:
++        return PatternValue(self.regex_parser.add_character(character))
++
++    def key(self) -> Hashable:
++        return ('pattern', self.regex_parser.context, self.regex_parser.current_state)
++
++
++_INPUT_CHARSET_CACHE: Dict[Hashable, 'CharSet'] = {}
++_INPUT_CHARSET_CACHE_LIMIT = 100000
++
++
++# Stages of the escape sequence state machine.
++_RAW = 0                  # between the quotes, outside any escape
++_AFTER_BACKSLASH = 1      # a backslash was seen
++_UNICODE_HEX = 2          # inside the four hex digits of a \u escape
++_SURROGATE_BACKSLASH = 3  # a high surrogate escape was seen, its low surrogate must follow
++_SURROGATE_MARKER = 4     # the backslash of the low surrogate escape was seen
++_SURROGATE_HEX = 5        # inside the four hex digits of the low surrogate escape
++
++
++class JsonStringValue:
++    """The state of a JSON string value: how much of the decoded value was parsed, and how much
++    of an escape sequence is pending."""
++    __slots__ = ('constraint', 'stage', 'digits', 'digit_value', 'high_surrogate')
++
++    def __init__(self, constraint: StringValueConstraint, stage: int = _RAW,
++                 digits: int = 0, digit_value: int = 0, high_surrogate: int = 0):
++        self.constraint = constraint
++        self.stage = stage
++        self.digits = digits
++        self.digit_value = digit_value
++        self.high_surrogate = high_surrogate
++
++    @staticmethod
++    def create(allowed_strings: Optional[Sequence[str]], min_length: Optional[int],
++               max_length: Optional[int], regex_parser) -> 'JsonStringValue':
++        if regex_parser is not None:
++            constraint: StringValueConstraint = PatternValue(regex_parser)
++        elif allowed_strings:
++            constraint = EnumValue.create(allowed_strings, min_length, max_length)
++        else:
++            constraint = FreeTextValue(min_length, max_length)
++        return JsonStringValue(constraint)
++
++    def is_unconstrained_text(self) -> bool:
++        """Whether the value is free text in its initial escape state, which lets the token
++        enforcer use its precalculated token lists."""
++        return self.stage == _RAW and isinstance(self.constraint, FreeTextValue)
++
++    def input_charset(self) -> CharSet:
++        """The characters allowed next, including the closing quote if the value may end.
++
++        The byte level engine asks for this once per node of the token trie, so the result is
++        cached by the state key."""
++        key = self.key()
++        charset = _INPUT_CHARSET_CACHE.get(key)
++        if charset is None:
++            charset = self.allowed_characters()
++            if self.can_close():
++                charset = charset | _QUOTE
++            if len(_INPUT_CHARSET_CACHE) > _INPUT_CHARSET_CACHE_LIMIT:
++                _INPUT_CHARSET_CACHE.clear()
++            _INPUT_CHARSET_CACHE[key] = charset
++        return charset
++
++    def is_outside_escape(self) -> bool:
++        """Whether the next character starts a new raw character, escape or the closing quote."""
++        return self.stage == _RAW
++
++    def can_close(self) -> bool:
++        """Whether the closing quote may be written now."""
++        return self.stage == _RAW and self.constraint.can_end()
++
++    def allowed_characters(self) -> CharSet:
++        """The characters allowed next, not counting the closing quote."""
++        stage = self.stage
++        allowed = self.constraint.allowed_characters()
++        if stage == _RAW:
++            charset = allowed & RAW_CHARACTERS
++            if allowed:
++                # Any character can be written as an escape sequence.
++                charset = charset | _BACKSLASH
++            return charset
++        if stage == _AFTER_BACKSLASH:
++            charset = CharSet.from_chars(
++                character for character, decoded in _SHORT_ESCAPES.items()
++                if allowed.contains(ord(decoded)))
++            if allowed:
++                charset = charset | _UNICODE_ESCAPE_MARKER
++            return charset
++        if stage == _UNICODE_HEX:
++            return self._allowed_hex_digits(allowed, False)
++        if stage == _SURROGATE_BACKSLASH:
++            return _BACKSLASH if self._surrogate_pair_possible(allowed) else CharSet()
++        if stage == _SURROGATE_MARKER:
++            return _UNICODE_ESCAPE_MARKER if self._surrogate_pair_possible(allowed) else CharSet()
++        return self._allowed_hex_digits(allowed, True)
++
++    def _surrogate_pair_possible(self, allowed: CharSet) -> bool:
++        base = _supplementary_base(self.high_surrogate)
++        return allowed.intersects(base, base + 0x3FF)
++
++    def _allowed_hex_digits(self, allowed: CharSet, low_surrogate: bool) -> CharSet:
++        shift = 4 * (3 - self.digits)
++        span = (1 << shift) - 1
++        charset = CharSet()
++        for digit in range(16):
++            first = ((self.digit_value << 4) | digit) << shift
++            last = first + span
++            if low_surrogate:
++                usable = _low_surrogate_usable(allowed, self.high_surrogate, first, last)
++            else:
++                usable = _code_unit_usable(allowed, first, last)
++            if usable:
++                charset = charset | _HEX_DIGIT_CHARACTERS[digit]
++        return charset
++
++    def add_character(self, character: str) -> 'JsonStringValue':
++        stage = self.stage
++        if stage == _RAW:
++            if character == BACKSLASH:
++                return JsonStringValue(self.constraint, _AFTER_BACKSLASH)
++            return JsonStringValue(self.constraint.add_character(character))
++        if stage == _AFTER_BACKSLASH:
++            if character == 'u':
++                return JsonStringValue(self.constraint, _UNICODE_HEX)
++            decoded = _SHORT_ESCAPES.get(character)
++            if decoded is None:
++                return JsonStringValue(DEAD_VALUE)
++            return JsonStringValue(self.constraint.add_character(decoded))
++        if stage == _SURROGATE_BACKSLASH:
++            if character != BACKSLASH:
++                return JsonStringValue(DEAD_VALUE)
++            return JsonStringValue(self.constraint, _SURROGATE_MARKER, high_surrogate=self.high_surrogate)
++        if stage == _SURROGATE_MARKER:
++            if character != 'u':
++                return JsonStringValue(DEAD_VALUE)
++            return JsonStringValue(self.constraint, _SURROGATE_HEX, high_surrogate=self.high_surrogate)
++        # Inside the hex digits of a \u escape.
++        digit = _hex_value(character)
++        if digit is None:
++            return JsonStringValue(DEAD_VALUE)
++        value = (self.digit_value << 4) | digit
++        digits = self.digits + 1
++        if digits < 4:
++            return JsonStringValue(self.constraint, stage, digits, value, self.high_surrogate)
++        if stage == _SURROGATE_HEX:
++            if not FIRST_LOW_SURROGATE <= value <= LAST_LOW_SURROGATE:
++                return JsonStringValue(DEAD_VALUE)
++            code_point = _supplementary_base(self.high_surrogate) + (value - FIRST_LOW_SURROGATE)
++            return JsonStringValue(self.constraint.add_character(chr(code_point)))
++        if FIRST_HIGH_SURROGATE <= value <= LAST_HIGH_SURROGATE:
++            return JsonStringValue(self.constraint, _SURROGATE_BACKSLASH, high_surrogate=value)
++        if FIRST_LOW_SURROGATE <= value <= LAST_LOW_SURROGATE:
++            return JsonStringValue(DEAD_VALUE)  # an unpaired low surrogate
++        return JsonStringValue(self.constraint.add_character(chr(value)))
++
++    def key(self) -> Hashable:
++        return (self.stage, self.digits, self.digit_value, self.high_surrogate, self.constraint.key())
++
++
++def _supplementary_base(high_surrogate: int) -> int:
++    return 0x10000 + ((high_surrogate - FIRST_HIGH_SURROGATE) << 10)
++
++
++def _code_unit_usable(allowed: CharSet, first: int, last: int) -> bool:
++    """Whether a \\u escape whose code unit is in [first, last] can produce an allowed character."""
++    if first <= FIRST_SURROGATE - 1 and allowed.intersects(first, min(last, FIRST_SURROGATE - 1)):
++        return True
++    if last >= LAST_SURROGATE + 1 and allowed.intersects(max(first, LAST_SURROGATE + 1), last):
++        return True
++    high_first = max(first, FIRST_HIGH_SURROGATE)
++    high_last = min(last, LAST_HIGH_SURROGATE)
++    if high_first <= high_last:
++        # A high surrogate escape has to be followed by a low surrogate escape, and together they
++        # can spell any of the supplementary characters of these high surrogates.
++        if allowed.intersects(_supplementary_base(high_first), _supplementary_base(high_last) + 0x3FF):
++            return True
++    return False
++
++
++def _low_surrogate_usable(allowed: CharSet, high_surrogate: int, first: int, last: int) -> bool:
++    low_first = max(first, FIRST_LOW_SURROGATE)
++    low_last = min(last, LAST_LOW_SURROGATE)
++    if low_first > low_last:
++        return False
++    base = _supplementary_base(high_surrogate)
++    return allowed.intersects(base + (low_first - FIRST_LOW_SURROGATE),
++                              base + (low_last - FIRST_LOW_SURROGATE))
++
++
++def _hex_value(character: str) -> Optional[int]:
++    code_point = ord(character)
++    if 0x30 <= code_point <= 0x39:
++        return code_point - 0x30
++    if 0x61 <= code_point <= 0x66:
++        return code_point - 0x61 + 10
++    if 0x41 <= code_point <= 0x46:
++        return code_point - 0x41 + 10
++    return None
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/regexcharsets.py submission/lmformatenforcer/regexcharsets.py
+--- lmformatenforcer/regexcharsets.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/regexcharsets.py	2026-10-15 14:36:54
+@@ -0,0 +1,88 @@
++"""CharSets for the states of a RegexParser's FSM.
++
++`RegexParser.get_allowed_characters()` expands the FSM's `anything_else` symbol with the
++characters of the configured alphabet. Byte level enforcement instead needs the exact set of
++unicode scalar values that keep the regex on a path to a full match, so the sets are computed
++from the FSM here and cached on the parser's shared context.
++"""
++from typing import Dict, Set
++
++from interegular.fsm import anything_else
++
++from .charsets import CharSet, SCALAR_VALUES
++
++
++class _FsmCharSets:
++    def __init__(self, fsm):
++        self.fsm = fsm
++        self.live_states = _live_states(fsm)
++        self.state_charsets: Dict[int, CharSet] = {}
++        explicit = CharSet.from_chars(symbol for symbol in fsm.alphabet.keys() if symbol != anything_else)
++        self.anything_else_charset = explicit.complement()
++        self.transition_charsets: Dict[int, CharSet] = {}
++
++    def transition_charset(self, transition: int) -> CharSet:
++        charset = self.transition_charsets.get(transition)
++        if charset is None:
++            symbols = self.fsm.alphabet.by_transition[transition]
++            charset = CharSet.from_chars(symbol for symbol in symbols if symbol != anything_else)
++            if any(symbol == anything_else for symbol in symbols):
++                charset = charset | self.anything_else_charset
++            self.transition_charsets[transition] = charset
++        return charset
++
++    def state_charset(self, state: int) -> CharSet:
++        charset = self.state_charsets.get(state)
++        if charset is None:
++            charset = CharSet()
++            for transition, target in self.fsm.map.get(state, {}).items():
++                if target in self.live_states:
++                    charset = charset | self.transition_charset(transition)
++            charset = charset & SCALAR_VALUES
++            self.state_charsets[state] = charset
++        return charset
++
++
++def _live_states(fsm) -> Set[int]:
++    """The states from which a final state is reachable."""
++    incoming: Dict[int, Set[int]] = {}
++    for state, transitions in fsm.map.items():
++        for target in transitions.values():
++            incoming.setdefault(target, set()).add(state)
++    live = set(state for state in fsm.finals if state in fsm.states)
++    pending = list(live)
++    while pending:
++        state = pending.pop()
++        for source in incoming.get(state, ()):
++            if source not in live:
++                live.add(source)
++                pending.append(source)
++    return live
++
++
++def fsm_charsets(context) -> _FsmCharSets:
++    """The cached CharSets of the FSM of a RegexParser context."""
++    charsets = getattr(context, 'byte_level_charsets', None)
++    if charsets is None:
++        charsets = _FsmCharSets(context.pattern)
++        context.byte_level_charsets = charsets
++    return charsets
++
++
++def regex_charset(parser) -> CharSet:
++    """The characters that keep a RegexParser on a path to a full match."""
++    if parser.current_state < 0:  # UNINITIALIZED_STATE / INVALID_STATE
++        return CharSet()
++    return fsm_charsets(parser.context).state_charset(parser.current_state)
++
++
++def regex_can_end(parser) -> bool:
++    """Whether the regex fully matches what the parser has consumed so far."""
++    return parser.current_state in parser.context.pattern.finals
++
++
++def regex_is_live(parser) -> bool:
++    """Whether some string accepted by the regex starts with what the parser has consumed."""
++    if parser.current_state < 0:
++        return False
++    return parser.current_state in fsm_charsets(parser.context).live_states
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/tokenbytes.py submission/lmformatenforcer/tokenbytes.py
+--- lmformatenforcer/tokenbytes.py	1970-01-01 05:30:00
++++ submission/lmformatenforcer/tokenbytes.py	2026-10-15 14:36:54
+@@ -0,0 +1,112 @@
++"""The exact bytes that every token of a tokenizer adds to the generated output.
++
++`TokenEnforcerTokenizerData` can be given a `token_bytes` mapping in order to enforce formats
++on the bytes of the tokens instead of on their decoded strings, which is what byte level
++vocabularies need. This module builds that mapping from a `tokenizers.Tokenizer`, for the two
++vocabulary families in which a token maps to a fixed byte string:
++
++* byte level BPE (GPT-2 style), where every character of a token stands for one byte, and
++* SentencePiece style BPE with byte fallback (Llama style), where a piece is either a single
++  byte written as `<0xNN>` or text in which U+2581 stands for a space.
++"""
++import json
++import re
++from functools import lru_cache
++from typing import Any, Dict, Optional
++
++_BYTE_FALLBACK_PIECE = re.compile(r"^<0x([0-9a-fA-F]{2})>$")
++_SENTENCEPIECE_SPACE = "▁"
++
++
++@lru_cache(maxsize=1)
++def byte_to_unicode() -> Dict[int, str]:
++    """The byte to unicode table of byte level BPE vocabularies (GPT-2 style)."""
++    printable = (list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) +
++                 list(range(ord("®"), ord("ÿ") + 1)))
++    bytes_ = printable[:]
++    code_points = printable[:]
++    extra = 0
++    for byte in range(256):
++        if byte not in bytes_:
++            bytes_.append(byte)
++            code_points.append(256 + extra)
++            extra += 1
++    return {byte: chr(code_point) for byte, code_point in zip(bytes_, code_points)}
++
++
++@lru_cache(maxsize=1)
++def unicode_to_byte() -> Dict[str, int]:
++    """The inverse of `byte_to_unicode()`."""
++    return {character: byte for byte, character in byte_to_unicode().items()}
++
++
++def token_bytes_from_tokenizer(tokenizer) -> Dict[int, bytes]:
++    """The bytes that every regular token of `tokenizer` contributes to the output.
++
++    :param tokenizer: A `tokenizers.Tokenizer`.
++    :return: A mapping from token id to bytes, for every id of the tokenizer's vocabulary
++    (without added tokens) except the special added tokens.
++    :raises ValueError: If the vocabulary is neither byte level BPE nor a byte fallback
++    SentencePiece style vocabulary, or if a token cannot be mapped to bytes.
++    """
++    configuration = _tokenizer_configuration(tokenizer)
++    vocabulary = tokenizer.get_vocab(with_added_tokens=False)
++    special_ids = _special_token_ids(tokenizer)
++    if _has_byte_level_decoder(configuration.get("decoder")):
++        convert = _byte_level_piece
++    elif (configuration.get("model") or {}).get("byte_fallback"):
++        convert = _byte_fallback_piece
++    else:
++        raise ValueError(
++            "token_bytes_from_tokenizer supports byte level BPE vocabularies (a ByteLevel "
++            "decoder) and SentencePiece style vocabularies with byte fallback, but this "
++            "tokenizer is neither")
++    token_bytes = {}
++    for piece, token_id in vocabulary.items():
++        if token_id in special_ids:
++            continue
++        token_bytes[token_id] = convert(piece)
++    return token_bytes
++
++
++def _tokenizer_configuration(tokenizer) -> Dict[str, Any]:
++    """The serialized form of the tokenizer, which describes its model and decoder."""
++    try:
++        return json.loads(tokenizer.to_str())
++    except AttributeError as error:
++        raise ValueError(f"Expected a tokenizers.Tokenizer, got {type(tokenizer)}") from error
++
++
++def _special_token_ids(tokenizer) -> set:
++    try:
++        added_tokens = tokenizer.get_added_tokens_decoder()
++    except AttributeError:
++        return set()
++    return set(token_id for token_id, added_token in added_tokens.items()
++               if getattr(added_token, 'special', False))
++
++
++def _has_byte_level_decoder(decoder: Optional[Dict[str, Any]]) -> bool:
++    """Whether the decoder is a ByteLevel decoder, on its own or inside a Sequence."""
++    if not decoder:
++        return False
++    if decoder.get("type") == "ByteLevel":
++        return True
++    if decoder.get("type") == "Sequence":
++        return any(_has_byte_level_decoder(inner) for inner in decoder.get("decoders") or [])
++    return False
++
++
++def _byte_level_piece(piece: str) -> bytes:
++    table = unicode_to_byte()
++    try:
++        return bytes(table[character] for character in piece)
++    except KeyError as error:
++        raise ValueError(f"The token {piece!r} is not a byte level token: {error}") from error
++
++
++def _byte_fallback_piece(piece: str) -> bytes:
++    match = _BYTE_FALLBACK_PIECE.match(piece)
++    if match:
++        return bytes((int(match.group(1), 16),))
++    return piece.replace(_SENTENCEPIECE_SPACE, " ").encode("utf-8")
+diff -ruN -x __pycache__ -x *.pyc lmformatenforcer/tokenenforcer.py submission/lmformatenforcer/tokenenforcer.py
+--- lmformatenforcer/tokenenforcer.py	2026-04-04 20:27:49
++++ submission/lmformatenforcer/tokenenforcer.py	2026-10-15 14:36:54
+@@ -1,8 +1,11 @@
++from bisect import bisect_left
+ from dataclasses import dataclass, field, replace
+ import sys
+ from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Union
+ import logging
+ 
++from .bytelevel import ByteLevelTokenCollector, TokenByteData
++from .charsets import unicode_alphabet_active, utf8_strict_prefix_length
+ from .exceptions import LMFormatEnforcerException
+ from .characterlevelparser import CharacterLevelParser, ForceStopParser, CharacterLevelParserConfig
+ from .tokenizerprefixtree import TokenizerPrefixTree, TokenizerPrefixTreeNode
+@@ -17,13 +20,18 @@
+                  decoder: Callable[[List[int]], str],
+                  eos_token_id: Union[int, List[int]],
+                  use_bitmask: bool,
+-                 vocab_size: int):
++                 vocab_size: int,
++                 token_bytes: Optional[Dict[int, bytes]] = None):
+         """
+         Create the tokenizer data that the TokenEnforcer needs. This can be reused for multiple TokenEnforcers if they work with the same tokenizer.
+         :param regular_tokens: A list of tuples (token_id, token_string, is_new_word_token) for all the regular (not special) tokens in the tokenizer vocabulary.
+         Note that token_string is expected to include leading / trailing whitespaces if relevant.
+         :param decoder: A function that decodes a list of token ids into a string.
+         :param eos_token_id: The token id(s) of the end-of-string token(s).
++        :param token_bytes: Optional. A mapping from token id to the exact bytes that the token adds to the
++        generated output. Byte level BPE vocabularies have tokens that hold only a part of a character, which
++        cannot be expressed as a string, so when this mapping is given the TokenEnforcer works on the bytes
++        of the tokens instead of on their decoded strings.
+         """
+         filtered_regular_tokens = [token_tuple for token_tuple in regular_tokens if token_tuple[0] <= vocab_size]
+         self.regular_tokens = filtered_regular_tokens
+@@ -33,6 +41,12 @@
+         self.tokenizer_alphabet = "".join(token_str for token_str in self.tokenizer_tree.root.children.keys() if len(token_str) == 1)
+         self.vocab_size = vocab_size
+         self.use_bitmask = use_bitmask
++        self.token_bytes = token_bytes
++        self.token_byte_data: Optional[TokenByteData] = None
++        if token_bytes is not None:
++            regular_token_ids = set(token_tuple[0] for token_tuple in filtered_regular_tokens)
++            self.token_byte_data = TokenByteData({token_id: data for token_id, data in token_bytes.items()
++                                                  if token_id in regular_token_ids})
+ 
+ 
+ class TokenEnforcer:
+@@ -43,6 +57,8 @@
+         parser: CharacterLevelParser
+         allowed_tokens: TokenList | None = field(default=None)
+         current_word_tokens: List[int] = field(default_factory=list)
++        pending_bytes: bytes = field(default=b'')
++        """The bytes of an incomplete character, in byte level mode"""
+         
+ 
+     def __init__(self, tokenizer_data: TokenEnforcerTokenizerData, parser: CharacterLevelParser):
+@@ -60,6 +76,10 @@
+         self.allowed_token_cache: Dict[Hashable, Any] = {}
+         self.use_bitmask = tokenizer_data.use_bitmask
+         self.vocab_size = tokenizer_data.vocab_size
++        self.token_byte_data = tokenizer_data.token_byte_data
++        self.byte_collector: Optional[ByteLevelTokenCollector] = None
++        if self.token_byte_data is not None:
++            self.byte_collector = ByteLevelTokenCollector(self.token_byte_data)
+         
+         
+         # Preserve the parser's existing config (e.g., force_json_field_order) when updating alphabet
+@@ -90,13 +110,19 @@
+         else:
+             # Find the state that led to this node. We explicitly don't use the concept of "timestep" because of beam search        
+             prev_step_state = self.prefix_states[prev_step_tuple]
+-            new_state = self._apply_new_characters(prev_step_state, token_sequence)
++            if self.byte_collector is not None:
++                new_state = self._apply_new_token_bytes(prev_step_state, token_sequence)
++            else:
++                new_state = self._apply_new_characters(prev_step_state, token_sequence)
+             self.prefix_states[sent_tuple] = new_state
+             self._compute_allowed_tokens(sent_tuple, new_state)
+             return new_state.allowed_tokens
+ 
+     def _compute_allowed_tokens(self, state_tokens: Tuple, state: 'TokenEnforcer.OutputTensorState'):
+         try:
++            if self.byte_collector is not None:
++                state.allowed_tokens = self._compute_allowed_tokens_from_bytes(state)
++                return
+             allowed_tokens: TokenList = TokenList(self.use_bitmask, self.vocab_size)
+             
+             cache_key = state.parser.cache_key()
+@@ -134,6 +160,51 @@
+                 state.allowed_tokens.extend(self.eos_token_id)
+             else:
+                 state.allowed_tokens.append(self.eos_token_id)
++
++    def _compute_allowed_tokens_from_bytes(self, state: 'TokenEnforcer.OutputTensorState') -> TokenList:
++        """The tokens whose bytes keep the output a strict UTF-8 prefix of a string the parser accepts."""
++        assert self.byte_collector is not None
++        with unicode_alphabet_active():
++            token_ids = self.byte_collector.allowed_tokens(state.parser, state.pending_bytes)
++            # The end of sequence token is allowed when the output is complete UTF-8 that the
++            # parser accepts in full.
++            can_end = not state.pending_bytes and state.parser.can_end()
++        if can_end:
++            eos_token_ids = self.eos_token_id if isinstance(self.eos_token_id, list) else [self.eos_token_id]
++            token_ids = list(token_ids)
++            for eos_token_id in eos_token_ids:
++                index = bisect_left(token_ids, eos_token_id)
++                if index == len(token_ids) or token_ids[index] != eos_token_id:
++                    token_ids.insert(index, eos_token_id)
++        allowed_tokens = TokenList(self.use_bitmask, self.vocab_size)
++        allowed_tokens.extend(token_ids)
++        return allowed_tokens
++
++    def _apply_new_token_bytes(self, state: 'TokenEnforcer.OutputTensorState', token_sequence: List[int]):
++        """Advance the parser with the bytes of the last token, keeping the bytes of an incomplete
++        character pending until a later token completes it."""
++        assert self.token_byte_data is not None
++        new_state = TokenEnforcer.OutputTensorState(parser=state.parser, pending_bytes=state.pending_bytes)
++        new_token_bytes = self.token_byte_data.token_bytes.get(token_sequence[-1])
++        if new_token_bytes is None:
++            return new_state  # Not a regular token, it adds nothing to the output
++        new_bytes = state.pending_bytes + new_token_bytes
++        complete_length = utf8_strict_prefix_length(new_bytes)
++        if complete_length is None:
++            # This can happen in beam / batch scenarios, when some of the batches finished but others are continuing.
++            logging.debug(f"Received bytes that are not valid UTF-8 ({new_bytes!r}), switching to ForceStopParser")
++            new_state.parser = ForceStopParser()
++            new_state.pending_bytes = b''
++            return new_state
++        new_state.pending_bytes = new_bytes[complete_length:]
++        with unicode_alphabet_active():
++            for character in new_bytes[:complete_length].decode('utf-8'):
++                try:
++                    new_state.parser = new_state.parser.add_character(character)
++                except Exception as e:
++                    logging.debug(f"Received an invalid character '{character}', switching to ForceStopParser (Exception:{e})")
++                    new_state.parser = ForceStopParser()
++        return new_state
+ 
+     def _collect_allowed_tokens(self, parser: CharacterLevelParser, tree_node: TokenizerPrefixTreeNode, allowed_tokens: TokenList, shortcut_key: Optional[Hashable]):
+         allowed_tokens.extend(tree_node.tokens)
